@@ -454,12 +454,12 @@ def _setup_auto(args, cfg: dict, models_dir: Path, bin_dir: Path) -> int:
     if need_runtime:
         plan = fetch.runtime_plan()
         if plan["warn"]:
-            out(f"  {YELLOW('note')}: {plan['warn']}")
+            warn(f"  {YELLOW('note')}: {plan['warn']}")
         if plan["kind"] == "none":
-            out(f"  {RED('no runtime available')}: {plan['reason']}")
-            out(fetch.manual_instructions())
+            warn(f"  {RED('no runtime available')}: {plan['reason']}")
+            warn(fetch.manual_instructions())
             if fetch.platform_key()[0] == "Linux":
-                out(fetch.source_build_instructions())
+                warn(fetch.source_build_instructions())
             return 1
         if plan["kind"] == "compat":
             print(f"  {YELLOW('note')}: {plan['reason']}")

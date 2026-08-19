@@ -351,8 +351,8 @@ class TestSetupCommand:
                                              "size": 0, "reason": "musl libc", "warn": ""})
         rc = cli.cmd_setup(_Args(auto=True), {})
         assert rc == 1
-        out = capsys.readouterr().out
-        assert "musl libc" in out and "setup --model" in out
+        err = capsys.readouterr().err
+        assert "musl libc" in err and "setup --model" in err
 
     def test_auto_needs_no_tty(self, home, monkeypatch, capsys):
         """--auto must work in a Dockerfile or CI step with stdin closed."""
