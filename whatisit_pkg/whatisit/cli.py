@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -21,8 +22,26 @@ from . import config as cfg_mod
 from . import engine, fetch
 from .safety import check
 
-# Colour only when attached to a terminal, and honour NO_COLOR.
+# Colour only when attached to a terminal, and honour NO_COLOR. Tracked per
+# stream: colour is chosen against stdout but half the output goes to stderr,
+# so `whatisit foo 2>err.log` would otherwise write escape codes into the file.
 _TTY = sys.stdout.isatty() and os.environ.get("NO_COLOR") is None
+_TTY_ERR = sys.stderr.isatty() and os.environ.get("NO_COLOR") is None
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def out(msg: str) -> None:
+    """The command itself, and anything the user asked to see."""
+    print(msg)
+
+
+def warn(msg: str = "", end: str = "\n") -> None:
+    """Everything else.
+
+    `eval "$(whatisit -q ...)"` runs whatever reaches stdout, so a stray
+    print() there is executed rather than read. #19 shipped exactly that.
+    """
+    print(msg if _TTY_ERR else _ANSI_RE.sub("", msg), file=sys.stderr, end=end)
 
 
 def _is_windows() -> bool:
@@ -53,9 +72,9 @@ def print_findings(findings) -> bool:
     for sev, why in findings:
         if sev == "DANGER":
             danger = True
-            print(f"  {RED('!! DANGER')}  {why}", file=sys.stderr)
+            warn(f"  {RED('!! DANGER')}  {why}")
         else:
-            print(f"  {YELLOW('!  caution')} {why}", file=sys.stderr)
+            warn(f"  {YELLOW('!  caution')} {why}")
     return danger
 
 
@@ -108,9 +127,8 @@ def _warn_stray_flags(args) -> None:
         return
     first = stray[0]
     rest = " ".join(w for w in args.words if w not in stray)
-    print(DIM(f"  note: {first} was read as part of your request, not as a flag."),
-          file=sys.stderr)
-    print(DIM(f"        flags go first:  whatisit {first} {rest}"), file=sys.stderr)
+    warn(DIM(f"  note: {first} was read as part of your request, not as a flag."))
+    warn(DIM(f"        flags go first:  whatisit {first} {rest}"))
 
 
 def _emit_debug(prompt: str, system: str, user_msg: str, grammar: str | None) -> None:
@@ -126,7 +144,7 @@ def _emit_debug(prompt: str, system: str, user_msg: str, grammar: str | None) ->
 def cmd_query(args, cfg: dict) -> int:
     prompt = " ".join(args.words).strip()
     if not prompt:
-        print("whatisit: nothing to do -- give me a request in plain English", file=sys.stderr)
+        warn("whatisit: nothing to do -- give me a request in plain English")
         return 2
 
     # Per-invocation overrides from CLI flags. These win over the saved config
@@ -166,21 +184,21 @@ def cmd_query(args, cfg: dict) -> int:
     remote = cfg_mod.remote_config(cfg)
     if remote is not None:
         for w in engine.remote_warnings(remote):
-            print(DIM(f"  note: {w}"), file=sys.stderr)
+            warn(DIM(f"  note: {w}"))
 
     try:
         cmds, elapsed, mode = engine.generate(
             prompt, cfg, n=args.num, force_oneshot=args.oneshot, quiet=args.quiet,
             for_execution=args.execute or args.quiet)
     except FileNotFoundError as e:
-        print(f"whatisit: {e}", file=sys.stderr)
+        warn(f"whatisit: {e}")
         return 3
     except Exception as e:
-        print(f"whatisit: generation failed: {e}", file=sys.stderr)
+        warn(f"whatisit: generation failed: {e}")
         return 4
 
     if not cmds:
-        print("whatisit: the model returned nothing usable. Try rephrasing.", file=sys.stderr)
+        warn("whatisit: the model returned nothing usable. Try rephrasing.")
         return 5
 
     # --quiet keeps STDOUT bare so it composes: x=$(whatisit -q ...).
@@ -190,18 +208,19 @@ def cmd_query(args, cfg: dict) -> int:
     if args.quiet:
         findings = check(cmds[0])
         if any(sev == "DANGER" for sev, _ in findings):
-            print("whatisit: refusing to emit a command flagged DANGER:", file=sys.stderr)
+            warn("whatisit: refusing to emit a command flagged DANGER:")
             print_findings(findings)
             return 6
-        print(cmds[0])
+        out(cmds[0])
         if findings:
+            sys.stdout.flush()
             print_findings(findings)
         _warn_stray_flags(args)
         return 0
 
     for i, c in enumerate(cmds):
         label = f"{DIM(f'{i+1}.')} " if len(cmds) > 1 else ""
-        print(f"{label}{BOLD(CYAN(c))}")
+        out(f"{label}{BOLD(CYAN(c))}")
         findings = check(c)
         if findings:
             # The command goes to stdout and warnings to stderr (so that
@@ -223,13 +242,13 @@ def cmd_query(args, cfg: dict) -> int:
         _log_query(prompt, cmds, elapsed, mode)
 
     if args.timing:
-        print(DIM(f"  [{elapsed:.2f}s, {mode} mode]"), file=sys.stderr)
+        warn(DIM(f"  [{elapsed:.2f}s, {mode} mode]"))
 
     if not args.execute:
         return 0
 
     if _is_windows():
-        print("whatisit: --execute is disabled on Windows", file=sys.stderr)
+        warn("whatisit: --execute is disabled on Windows")
         return 7
 
     # ---- execution path ----
@@ -238,8 +257,7 @@ def cmd_query(args, cfg: dict) -> int:
     # picking silently would run something the user never chose.
     if len(cmds) > 1:
         if not sys.stdin.isatty():
-            print("whatisit: several candidates -- rerun without -n, or pick one yourself.",
-                  file=sys.stderr)
+            warn("whatisit: several candidates -- rerun without -n, or pick one yourself.")
             return 6
         try:
             pick = input(f"\n{BOLD('Run which?')} [1-{len(cmds)}, or N to cancel] ").strip()
@@ -247,7 +265,7 @@ def cmd_query(args, cfg: dict) -> int:
             print()
             return 130
         if not pick.isdigit() or not 1 <= int(pick) <= len(cmds):
-            print("whatisit: not running.", file=sys.stderr)
+            warn("whatisit: not running.")
             return 0
         chosen = cmds[int(pick) - 1]
     else:
@@ -257,14 +275,13 @@ def cmd_query(args, cfg: dict) -> int:
     danger = any(sev == "DANGER" for sev, _ in findings)
 
     if danger:
-        print(f"\n{RED('Refusing to auto-run a command flagged DANGER.')}", file=sys.stderr)
-        print(DIM("Copy it and run it yourself if you are certain."), file=sys.stderr)
+        warn(f"\n{RED('Refusing to auto-run a command flagged DANGER.')}")
+        warn(DIM("Copy it and run it yourself if you are certain."))
         return 6
 
     if cfg.get("confirm_execute", True):
         if not sys.stdin.isatty():
-            print("whatisit: refusing to execute without an interactive confirmation.",
-                  file=sys.stderr)
+            warn("whatisit: refusing to execute without an interactive confirmation.")
             return 6
         # Default stays explicit: "y"/"yes" is required. -y/--yes or
         # confirm_default=true opts into treating an empty answer as yes.
@@ -277,10 +294,10 @@ def cmd_query(args, cfg: dict) -> int:
             print()
             return 130
         if ans not in accept:
-            print("whatisit: not running.", file=sys.stderr)
+            warn("whatisit: not running.")
             return 0
 
-    print(DIM(f"$ {chosen}"), file=sys.stderr)
+    warn(DIM(f"$ {chosen}"))
     shell = os.environ.get("SHELL", "/bin/bash")
     return subprocess.run([shell, "-c", chosen]).returncode
 
@@ -290,8 +307,7 @@ def _confirm(prompt: str, auto: bool) -> bool:
     if auto:
         return True
     if not sys.stdin.isatty():
-        print(f"  {YELLOW('skipped')}: {prompt} (no terminal to ask; use --auto)",
-              file=sys.stderr)
+        warn(f"  {YELLOW('skipped')}: {prompt} (no terminal to ask; use --auto)")
         return False
     try:
         return input(f"  {prompt} [Y/n] ").strip().lower() in ("", "y", "yes")
@@ -304,10 +320,10 @@ def _progress(got: int, total: int) -> None:
     if not total:
         return
     bar = got * 30 // total
-    print(f"\r    [{'#' * bar}{'.' * (30 - bar)}] {got * 100 // total:3d}%  "
-          f"{fetch.fmt_size(got)} / {fetch.fmt_size(total)}", end="", file=sys.stderr)
+    warn(f"\r    [{'#' * bar}{'.' * (30 - bar)}] {got * 100 // total:3d}%  "
+         f"{fetch.fmt_size(got)} / {fetch.fmt_size(total)}", end="")
     if got >= total:
-        print(file=sys.stderr)
+        warn()
 
 
 def _model_targets(size: str, models_dir: Path):
@@ -377,7 +393,7 @@ def cmd_setup(args, cfg: dict) -> int:
     elif args.model:
         src = Path(args.model).expanduser().resolve()
         if not src.exists():
-            print(f"  {RED('no such file')}: {src}", file=sys.stderr)
+            warn(f"  {RED('no such file')}: {src}")
             return 1
         # Symlink rather than copy by default: the model is ~1 GB and is
         # often already on shared or external storage. --copy overrides.
@@ -438,12 +454,12 @@ def _setup_auto(args, cfg: dict, models_dir: Path, bin_dir: Path) -> int:
     if need_runtime:
         plan = fetch.runtime_plan()
         if plan["warn"]:
-            print(f"  {YELLOW('note')}: {plan['warn']}")
+            out(f"  {YELLOW('note')}: {plan['warn']}")
         if plan["kind"] == "none":
-            print(f"  {RED('no runtime available')}: {plan['reason']}")
-            print(fetch.manual_instructions())
+            out(f"  {RED('no runtime available')}: {plan['reason']}")
+            out(fetch.manual_instructions())
             if fetch.platform_key()[0] == "Linux":
-                print(fetch.source_build_instructions())
+                out(fetch.source_build_instructions())
             return 1
         if plan["kind"] == "compat":
             print(f"  {YELLOW('note')}: {plan['reason']}")
@@ -503,8 +519,8 @@ def _setup_auto(args, cfg: dict, models_dir: Path, bin_dir: Path) -> int:
         if need_model:
             _fetch_model(args, spec, model_file, slot)
     except fetch.FetchError as e:
-        print(f"  {RED('failed')}: {e}", file=sys.stderr)
-        print(fetch.manual_instructions(), file=sys.stderr)
+        warn(f"  {RED('failed')}: {e}")
+        warn(fetch.manual_instructions())
         return 1
 
     return _finish_setup(cfg)
@@ -665,7 +681,7 @@ def cmd_config(args, cfg: dict) -> int:
     if args.set:
         for kv in args.set:
             if "=" not in kv:
-                print(f"whatisit: expected key=value, got {kv!r}", file=sys.stderr)
+                warn(f"whatisit: expected key=value, got {kv!r}")
                 return 2
             k, v = kv.split("=", 1)
             if v.lower() in ("true", "false"):
@@ -861,7 +877,7 @@ def main(argv=None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     # Before load_config, so an existing config.json is read from its new home.
     # Goes to stderr to keep `$(whatisit -q ...)` substitutions clean.
-    cfg_mod.migrate_legacy_dirs(echo=lambda m: print(m, file=sys.stderr))
+    cfg_mod.migrate_legacy_dirs(echo=warn)
     cfg = cfg_mod.load_config()
 
     if not argv:
@@ -882,7 +898,7 @@ def main(argv=None) -> int:
     try:
         args = QueryArgs(argv)
     except ValueError as e:
-        print(f"whatisit: {e}", file=sys.stderr)
+        warn(f"whatisit: {e}")
         return 2
     if not args.words:
         build_parser().print_help()

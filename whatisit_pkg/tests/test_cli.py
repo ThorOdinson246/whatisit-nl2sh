@@ -114,6 +114,18 @@ class TestSubcommandRoutingIsFirstTokenOnly:
 # --------------------------------------------------------------- cmd_query
 
 class TestCmdQueryQuietDangerRefusal:
+    def test_quiet_stdout_carries_only_the_command(self, monkeypatch, capsys):
+        """`eval "$(whatisit -q ...)"` runs whatever lands on stdout."""
+        monkeypatch.setattr(
+            cli.engine, "generate",
+            lambda prompt, cfg, n=1, force_oneshot=False, quiet=False, for_execution=False:
+                (["chmod 777 ./build"], 0.01, "server"))
+        rc = cli.main(["-q", "fix", "permissions"])
+        cap = capsys.readouterr()
+        assert rc == 0
+        assert cap.out == "chmod 777 ./build\n"
+        assert "caution" in cap.err
+
     def test_quiet_refuses_danger_command_exit_6(self, monkeypatch, capsys):
         monkeypatch.setattr(
             cli.engine, "generate",
