@@ -123,6 +123,28 @@ whatisit -e remove every .pyc file under this tree
 `whatisit stop` shuts down the resident model server. `whatisit config --set threads=4`
 changes settings.
 
+### Unloading the model automatically
+
+The resident server keeps the model in RAM so answers are instant. On a
+memory-constrained box you can have it unload itself after a period of
+inactivity instead of keeping that RAM forever:
+
+```bash
+whatisit --idle-timeout 300 show disk usage   # this invocation only
+whatisit config --set idle_timeout=300        # persist it (0 = never, default)
+```
+
+After 300 idle seconds a small watchdog process stops the server and frees the
+~1.6 GB it was holding. The next query simply starts fresh (cold start is a few
+seconds). The timeout is re-armed on every query, and an inference already in
+flight is never interrupted.
+
+Note: whatisit never uses llama-server's own `--sleep-idle-seconds` flag — in
+llama.cpp builds b7492–b9060 it triggers CVE-2026-43632 (use-after-free,
+remotely exploitable). The watchdog is plain user-space Python that watches a
+timestamp file and sends SIGTERM; nothing about it touches the server's HTTP
+surface.
+
 ## Remote endpoints
 
 To use a hosted API, Ollama, or a `llama.cpp` server you already have running:

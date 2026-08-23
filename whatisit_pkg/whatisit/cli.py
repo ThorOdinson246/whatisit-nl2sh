@@ -157,6 +157,8 @@ def cmd_query(args, cfg: dict) -> int:
         cfg["server_port"] = args.port
     if args.ctx_size is not None:
         cfg["ctx_size"] = args.ctx_size
+    if args.idle_timeout is not None:
+        cfg["idle_timeout"] = args.idle_timeout
     if args.host_context is not None:
         cfg["host_context"] = args.host_context
     if args.grammar is not None:
@@ -739,6 +741,8 @@ def build_parser() -> argparse.ArgumentParser:
                     help="override saved thread count for this invocation")
     ap.add_argument("--ctx-size", type=int, metavar="N",
                     help="override the saved context size for this invocation")
+    ap.add_argument("--idle-timeout", type=int, metavar="SECONDS",
+                    help="stop the resident server after SECONDS of inactivity (0 = never)")
     ap.add_argument("--model", metavar="PATH",
                     help="override the registered model for this invocation")
     ap.add_argument("--host-context", dest="host_context", action="store_true",
@@ -784,7 +788,8 @@ _FLAGS_NOARG = {"-e", "--execute", "-q", "--quiet", "-t", "--timing", "--oneshot
                 "--host-context", "--no-host-context",
                 "--grammar", "--no-grammar", "--debug", "-y", "--yes"}
 _FLAGS_ARG = {"-n", "--num"}
-_FLAGS_QUERY_ARG = {"--port", "--threads", "--ctx-size", "--model"}
+_FLAGS_QUERY_ARG = {"--port", "--threads", "--ctx-size", "--model",
+                    "--idle-timeout"}
 
 
 class QueryArgs:
@@ -805,6 +810,7 @@ class QueryArgs:
         self.num, self.execute, self.quiet = 1, False, False
         self.timing, self.oneshot = False, False
         self.port, self.threads, self.ctx_size, self.model = None, None, None, None
+        self.idle_timeout = None
         self.host_context, self.grammar, self.debug, self.yes = None, None, False, False
         i = 0
         while i < len(argv):
@@ -850,6 +856,10 @@ class QueryArgs:
                     self.ctx_size = int(val)
                     if self.ctx_size <= 0:
                         raise ValueError(f"--ctx-size must be > 0, got {self.ctx_size}")
+                elif a == "--idle-timeout":
+                    self.idle_timeout = int(val)
+                    if self.idle_timeout < 0:
+                        raise ValueError(f"--idle-timeout must be >= 0, got {self.idle_timeout}")
                 else:
                     self.model = val
                 i += 1
