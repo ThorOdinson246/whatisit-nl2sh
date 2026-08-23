@@ -244,6 +244,23 @@ it came from a command this model actually produced during testing, which means
 it covers the mistakes I've seen and not the ones I haven't. Read the command
 before you run it.
 
+## Community models
+
+Third-party fine-tunes that follow this project's benchmark protocol:
+
+| model | size | InterCode-ALFA | notes |
+|---|---|---|---|
+| [nl2sh-qwen25-coder-1.5b](https://huggingface.co/barbarabhb/nl2sh-qwen25-coder-1.5b-GGUF) | 941 MB (Q4_K_M) | 0.657 | trained with organic greeting/chatter data — addresses the `hello` → network-command behavior reported in #10 |
+
+Same base family as the default model, LoRA recipe close to the one above
+(32/64, all-linear, 2e-4 cosine), but on a broadened data pool: NL2SH-ALFA
+train split + tldr-pages + commandlinefu + NL2Bash + cli-1m sample +
+git-instruction. Examples are length-capped to 56 tokens, deduplicated, and
+decontaminated against this repo's test set.
+
+A Qwen3.5-2B hybrid-architecture variant is currently in training and will be
+added when its numbers are in.
+
 ## Development
 
 ```bash
