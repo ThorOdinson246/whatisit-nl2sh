@@ -495,3 +495,76 @@ class TestQueryFlagsApply:
         assert "--debug" in err
         assert "grammar-blob" in err
         assert "list files" in err
+
+
+
+
+# ------------------------------------------------------- --idle-timeout (#42)
+
+class TestIdleTimeoutFlag:
+    """Per-invocation idle-unload deadline, following the --port/--threads
+    value-flag pattern. The feature is the user-space watchdog; llama-server's
+    own --sleep-idle-seconds (the CVE-2026-43632 trigger) never appears."""
+
+    def _isolate(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("WHATISIT_CONFIG_DIR", str(tmp_path / "cfg"))
+        monkeypatch.setenv("WHATISIT_DATA_DIR", str(tmp_path / "data"))
+
+    def test_flag_parses(self):
+        a = cli.QueryArgs(["--idle-timeout", "300", "list", "files"])
+        assert a.idle_timeout == 300
+        assert a.words == ["list", "files"]
+
+    def test_defaults_to_none_when_absent(self):
+        assert cli.QueryArgs(["list", "files"]).idle_timeout is None
+
+    def test_missing_value_raises(self):
+        with pytest.raises(ValueError, match="needs a value"):
+            cli.QueryArgs(["--idle-timeout"])
+
+    def test_negative_rejected_zero_accepted(self):
+        with pytest.raises(ValueError, match="must be >= 0"):
+            cli.QueryArgs(["--idle-timeout", "-1", "list", "files"])
+        assert cli.QueryArgs(["--idle-timeout", "0",
+                              "list", "files"]).idle_timeout == 0
+
+    def test_stray_flag_is_reported_not_applied(self):
+        # After the request text starts, the flag belongs to the question.
+        a = cli.QueryArgs(["list", "files", "--idle-timeout", "300"])
+        assert a.idle_timeout is None
+        assert a.stray_flags == ["--idle-timeout"]
+
+    def _capture_generate(self, monkeypatch, seen):
+        monkeypatch.setattr(cli.engine, "generate",
+                            lambda prompt, cfg, **k:
+                                seen.update(cfg=dict(cfg))
+                                or (["ls"], 0.01, "server"))
+
+    def test_override_reaches_cmd_query(self, monkeypatch, tmp_path):
+        self._isolate(monkeypatch, tmp_path)
+        seen = {}
+        self._capture_generate(monkeypatch, seen)
+        assert cli.main(["--idle-timeout", "123", "list", "files"]) == 0
+        assert seen["cfg"]["idle_timeout"] == 123
+
+    def test_absent_leaves_default_and_zero_overrides_saved(
+            self, monkeypatch, tmp_path):
+        self._isolate(monkeypatch, tmp_path)
+        seen = {}
+        self._capture_generate(monkeypatch, seen)
+        assert cli.main(["list", "files"]) == 0
+        assert seen["cfg"]["idle_timeout"] == 0      # DEFAULTS: never unload
+        cli.main(["config", "--set", "idle_timeout=300"])
+        cap = {}
+        monkeypatch.setattr(cli.engine, "generate",
+                            lambda prompt, cfg, **k:
+                                cap.update(cfg=dict(cfg))
+                                or (["ls"], 0.01, "server"))
+        assert cli.main(["list", "files"]) == 0
+        assert cap["cfg"]["idle_timeout"] == 300     # persisted value wins
+        assert cli.main(["--idle-timeout", "0", "list", "files"]) == 0
+        assert cap["cfg"]["idle_timeout"] == 0       # explicit zero beats it
+        # Per-invocation overrides must NOT reach config.json (cmd_query's
+        # documented contract); the saved 300 has to survive untouched.
+        from whatisit import config as cfg_mod
+        assert cfg_mod.load_config()["idle_timeout"] == 300
