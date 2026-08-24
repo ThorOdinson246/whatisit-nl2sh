@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "whatisit"
 version = "0.3.0"
-description = "Natural language to shell command. Runs on your own machine by default, on CPU. No GPU, no API key, no network."
+description = "Natural language to shell command. Runs on your own machine on CPU, no GPU and no network; optionally any OpenAI-compatible endpoint."
 readme = "README.md"
 requires-python = ">=3.9"
 license = { text = "Apache-2.0" }
