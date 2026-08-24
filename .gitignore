@@ -82,3 +82,6 @@ whatisit_pkg/dist/
 # Coverage databases from a local pytest run.
 .coverage
 .coverage.*
+
+# Local agent workspace and worktrees.
+.claude/
