@@ -133,12 +133,12 @@ def _warn_stray_flags(args) -> None:
 
 def _emit_debug(prompt: str, system: str, user_msg: str, grammar: str | None) -> None:
     """Print the exact prompt + grammar the model sees, for diagnosing failures."""
-    print(DIM(f"  --debug: system prompt length = {len(system)}"), file=sys.stderr)
-    print(DIM(f"  --debug: grammar = {'none' if grammar is None else 'set'}"), file=sys.stderr)
-    print(DIM(f"  --debug: user prompt:\n{user_msg}"), file=sys.stderr)
+    warn(DIM(f"  --debug: system prompt length = {len(system)}"))
+    warn(DIM(f"  --debug: grammar = {'none' if grammar is None else 'set'}"))
+    warn(DIM(f"  --debug: user prompt:\n{user_msg}"))
     if grammar:
-        print(DIM(f"  --debug: GBNF grammar:\n{grammar}"), file=sys.stderr)
-    print(DIM(f"  --debug: request:\n{prompt}"), file=sys.stderr)
+        warn(DIM(f"  --debug: GBNF grammar:\n{grammar}"))
+    warn(DIM(f"  --debug: request:\n{prompt}"))
 
 
 def cmd_query(args, cfg: dict) -> int:
@@ -498,10 +498,9 @@ def _setup_auto(args, cfg: dict, models_dir: Path, bin_dir: Path) -> int:
     # Refuse before starting a download that cannot finish.
     free = fetch.free_bytes(cfg_mod.data_dir())
     if free < bytes_needed * 1.1:
-        print(f"  {RED('not enough disk space')}: need about "
-              f"{fetch.fmt_size(bytes_needed * 1.1)}, "
-              f"{fetch.fmt_size(free)} free at {cfg_mod.data_dir()}",
-              file=sys.stderr)
+        warn(f"  {RED('not enough disk space')}: need about "
+             f"{fetch.fmt_size(bytes_needed * 1.1)}, "
+             f"{fetch.fmt_size(free)} free at {cfg_mod.data_dir()}")
         return 1
 
     models_dir.mkdir(parents=True, exist_ok=True)
