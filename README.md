@@ -145,8 +145,9 @@ Details worth knowing:
 - A session expires after 15 minutes of silence or when you change directory.
 - Commands flagged `DANGER` are never stored, so history cannot be used to
   replay a dangerous command past the safety checker on a later "do it again".
-- Requests are kept on local disk only (`~/.local/share/whatisit/
-  session.jsonl`, owner-readable), at most three turns.
+- Requests are kept on local disk only, at most three turns: `session.jsonl`
+  inside your whatisit data directory (`~/.local/share/whatisit/` by default,
+  owner-readable), the same place `queries.jsonl` lives.
 - `whatisit session show` prints what is remembered; `whatisit session clear`
   wipes it.
 
