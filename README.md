@@ -1,7 +1,8 @@
 # whatisit-nl2sh
 
-Ask for a shell command in plain English. Runs on your own machine by default,
-on CPU. No GPU, no API key, no network. Answers in about a second.
+Ask for a shell command in plain English. Runs on your own machine on CPU, no
+GPU and no network. Answers in about a second. Optionally any OpenAI-compatible
+endpoint instead.
 
 ![whatisit in use](whatisit.gif)
 
