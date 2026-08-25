@@ -122,6 +122,34 @@ whatisit -e remove every .pyc file under this tree
 `whatisit stop` shuts down the resident model server. `whatisit config --set threads=4`
 changes settings.
 
+## Follow-up requests (sessions)
+
+By default every request is independent. Opt in with `--session` (or
+`whatisit config --set sessions=true`) and a follow-up that refers back to the
+previous request gets the context it needs:
+
+```bash
+whatisit --session list the python files in this folder
+find . -maxdepth 1 -name "*.py" | head -3
+
+whatisit --session delete them
+rm -f ./*.py
+```
+
+Details worth knowing:
+
+- History is injected **only when the request actually refers back** to
+  something ("them", "those", "run it again"). Ordinary requests get exactly
+  the same prompt as before, and `-q` output is always context-free so
+  scripting stays deterministic.
+- A session expires after 15 minutes of silence or when you change directory.
+- Commands flagged `DANGER` are never stored, so history cannot be used to
+  replay a dangerous command past the safety checker on a later "do it again".
+- Requests are kept on local disk only (`~/.local/share/whatisit/
+  session.jsonl`, owner-readable), at most three turns.
+- `whatisit session show` prints what is remembered; `whatisit session clear`
+  wipes it.
+
 ## Remote endpoints
 
 To use a hosted API, Ollama, or a `llama.cpp` server you already have running:
@@ -248,7 +276,8 @@ slot and, in brackets, the file that slot actually points at.
 This is still in development and will get things wrong. It assumes you know
 your way around a terminal well enough to spot a bad command and fix it.
 
-- Single-turn. No memory of your last command, no shell state.
+- Follow-ups need `--session` (off by default, see above), and even then the
+  1.5B may misresolve an ambiguous "them". No shell state is ever tracked.
 - Output caps at 64 tokens. That's a command, not a script.
 - English only, and measured on one 300-task benchmark, which is not the same
   as being good at shell.

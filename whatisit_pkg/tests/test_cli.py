@@ -11,11 +11,14 @@ These cover cases that were REAL bugs found by typing realistic requests:
 None of this starts a server or touches the network: engine.generate is
 monkeypatched wherever cmd_query would otherwise call into it.
 """
+import json
 import os
+import time
 
 import pytest
 
 from whatisit import cli
+from whatisit import sessions as sessions_mod
 
 # ------------------------------------------------------------------ QueryArgs
 
@@ -98,7 +101,7 @@ class TestSubcommandRoutingIsFirstTokenOnly:
         captured = {}
 
         def fake_generate(prompt, cfg, n=1, force_oneshot=False, quiet=False,
-                          for_execution=False):
+                          for_execution=False, extra_context=None):
             captured["prompt"] = prompt
             return (["git config --list"], 0.01, "server")
 
@@ -107,8 +110,8 @@ class TestSubcommandRoutingIsFirstTokenOnly:
         assert rc == 0
         assert captured["prompt"] == "show me the git config"
 
-    def test_setup_doctor_stop_are_recognized_subcommands(self):
-        assert cli.SUBCOMMANDS == {"setup", "doctor", "stop", "config"}
+    def test_setup_doctor_stop_session_config_are_recognized_subcommands(self):
+        assert cli.SUBCOMMANDS == {"setup", "doctor", "stop", "session", "config"}
 
 
 # --------------------------------------------------------------- cmd_query
@@ -118,7 +121,8 @@ class TestCmdQueryQuietDangerRefusal:
         """`eval "$(whatisit -q ...)"` runs whatever lands on stdout."""
         monkeypatch.setattr(
             cli.engine, "generate",
-            lambda prompt, cfg, n=1, force_oneshot=False, quiet=False, for_execution=False:
+            lambda prompt, cfg, n=1, force_oneshot=False, quiet=False,
+                    for_execution=False, extra_context=None:
                 (["chmod 777 ./build"], 0.01, "server"))
         rc = cli.main(["-q", "fix", "permissions"])
         cap = capsys.readouterr()
@@ -129,7 +133,8 @@ class TestCmdQueryQuietDangerRefusal:
     def test_quiet_refuses_danger_command_exit_6(self, monkeypatch, capsys):
         monkeypatch.setattr(
             cli.engine, "generate",
-            lambda prompt, cfg, n=1, force_oneshot=False, quiet=False, for_execution=False:
+            lambda prompt, cfg, n=1, force_oneshot=False, quiet=False,
+                    for_execution=False, extra_context=None:
                 (["rm -rf /"], 0.01, "server"))
         rc = cli.main(["-q", "delete", "everything"])
         assert rc == 6
@@ -142,7 +147,7 @@ class TestCmdQueryQuietDangerRefusal:
         captured = {}
 
         def fake_generate(prompt, cfg, n=1, force_oneshot=False, quiet=False,
-                          for_execution=False):
+                          for_execution=False, extra_context=None):
             captured["for_execution"] = for_execution
             return (["ls -la"], 0.01, "server")
 
@@ -153,11 +158,17 @@ class TestCmdQueryQuietDangerRefusal:
         out = capsys.readouterr()
         assert out.out.strip() == "ls -la"
 
-    def test_execute_marks_generation_as_execution_intended(self, monkeypatch):
+    def test_execute_marks_generation_as_execution_intended(
+            self, monkeypatch, tmp_path):
+        # Isolate config too: an ambient confirm_execute=false on a dev box
+        # would skip the refusal this test exists to pin (latent, pre-dating
+        # sessions -- surfaced here).
+        monkeypatch.setenv("WHATISIT_CONFIG_DIR", str(tmp_path / "cfg"))
+        monkeypatch.setenv("WHATISIT_DATA_DIR", str(tmp_path / "data"))
         captured = {}
 
         def fake_generate(prompt, cfg, n=1, force_oneshot=False, quiet=False,
-                          for_execution=False):
+                          for_execution=False, extra_context=None):
             captured["for_execution"] = for_execution
             return (["ls -la"], 0.01, "server")
 
@@ -171,7 +182,7 @@ class TestCmdQueryQuietDangerRefusal:
 
     def test_no_model_found_reports_and_exits_3(self, monkeypatch):
         def raise_not_found(prompt, cfg, n=1, force_oneshot=False, quiet=False,
-                            for_execution=False):
+                            for_execution=False, extra_context=None):
             raise FileNotFoundError("no model found -- run `whatisit setup`")
         monkeypatch.setattr(cli.engine, "generate", raise_not_found)
         rc = cli.main(["do", "something"])
@@ -187,7 +198,8 @@ class TestCmdQueryQuietDangerRefusal:
         monkeypatch.setattr(cli, "_is_windows", lambda: True)
         monkeypatch.setattr(
             cli.engine, "generate",
-            lambda prompt, cfg, n=1, force_oneshot=False, quiet=False, for_execution=False:
+            lambda prompt, cfg, n=1, force_oneshot=False, quiet=False,
+                    for_execution=False, extra_context=None:
                 (["ls -la"], 0.01, "server"))
         rc = cli.main(["-e", "list", "files"])
         assert rc == 7
@@ -199,7 +211,8 @@ class TestCmdQueryQuietDangerRefusal:
         monkeypatch.setattr(cli, "_is_windows", lambda: False)
         monkeypatch.setattr(
             cli.engine, "generate",
-            lambda prompt, cfg, n=1, force_oneshot=False, quiet=False, for_execution=False:
+            lambda prompt, cfg, n=1, force_oneshot=False, quiet=False,
+                    for_execution=False, extra_context=None:
                 (["ls -la"], 0.01, "server"))
         rc = cli.main(["-e", "list", "files"])
         assert rc != 7
@@ -298,7 +311,7 @@ class TestRemoteCli:
         monkeypatch.setenv("WHATISIT_OPENAI_MODEL", "m")
 
         def fake_generate(prompt, cfg, n=1, force_oneshot=False, quiet=False,
-                          for_execution=False):
+                          for_execution=False, extra_context=None):
             return (["ls"], 0.01, "remote")
 
         monkeypatch.setattr(cli.engine, "generate", fake_generate)
@@ -399,7 +412,7 @@ class TestQueryFlagsApply:
         self._isolate(monkeypatch, tmp_path)
         seen = {}
         def fake_generate(prompt, cfg, n=1, force_oneshot=False, quiet=False,
-                          for_execution=False):
+                          for_execution=False, extra_context=None):
             seen["cfg"] = dict(cfg)
             return (["ls -la"], 0.01, "server")
         monkeypatch.setattr(cli.engine, "generate", fake_generate)
@@ -414,7 +427,7 @@ class TestQueryFlagsApply:
         self._isolate(monkeypatch, tmp_path)
         seen = {}
         def fake_generate(prompt, cfg, n=1, force_oneshot=False, quiet=False,
-                          for_execution=False):
+                          for_execution=False, extra_context=None):
             seen["cfg"] = dict(cfg)
             return (["ls"], 0.01, "server")
         monkeypatch.setattr(cli.engine, "generate", fake_generate)
@@ -428,7 +441,8 @@ class TestQueryFlagsApply:
         monkeypatch.setattr(cli.engine, "generate",
                             lambda *a, **k: (["ls"], 0.01, "server"))
         monkeypatch.setattr(cli.engine.hostctx, "build",
-                            lambda p, enabled=True, cwd=None: ("SYS", p))
+                            lambda p, enabled=True, cwd=None, include_volatile=True,
+                            extra_context=None: ("SYS", p))
         rc = cli.main(["--debug", "list", "files"])
         assert rc == 0
         err = capsys.readouterr().err
@@ -442,7 +456,8 @@ class TestQueryFlagsApply:
         monkeypatch.setattr(cli.engine, "generate",
                             lambda *a, **k: (["ls"], 0.01, "server"))
         monkeypatch.setattr(cli.engine.hostctx, "build",
-                            lambda p, enabled=True, cwd=None: ("SYS", p))
+                            lambda p, enabled=True, cwd=None, include_volatile=True,
+                            extra_context=None: ("SYS", p))
         monkeypatch.setattr(cli.engine.hostctx, "stable_facts",
                             lambda *a, **k: {"pkg": "pacman"})
         # grammar_for_pkg may not exist (PR A vs PR B); if so, create a stub
@@ -456,3 +471,165 @@ class TestQueryFlagsApply:
         assert "--debug" in err
         assert "grammar-blob" in err
         assert "list files" in err
+
+
+# ---------------------------------------------------------- session memory
+
+class TestSessionMemory:
+    """Opt-in cross-invocation memory (sessions.py). Default OFF: every test
+    here either passes --session or pre-sets config sessions=true."""
+
+    def _isolate(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("WHATISIT_CONFIG_DIR", str(tmp_path / "cfg"))
+        monkeypatch.setenv("WHATISIT_DATA_DIR", str(tmp_path / "data"))
+
+    @staticmethod
+    def _fake_generate(monkeypatch, captured, cmds):
+        def fake_generate(prompt, cfg, n=1, force_oneshot=False, quiet=False,
+                          for_execution=False, extra_context=None):
+            captured["prompt"] = prompt
+            captured["extra_context"] = extra_context
+            return (cmds, 0.01, "server")
+        monkeypatch.setattr(cli.engine, "generate", fake_generate)
+
+    def _session_file(self, tmp_path):
+        return tmp_path / "data" / "session.jsonl"
+
+    def test_session_flag_parses_before_the_request(self):
+        a = cli.QueryArgs(["--session", "find", "logs"])
+        assert a.session is True
+        assert a.words == ["find", "logs"]
+
+    def test_off_by_default_records_nothing(self, monkeypatch, tmp_path):
+        self._isolate(monkeypatch, tmp_path)
+        captured = {}
+        self._fake_generate(monkeypatch, captured, ["ls"])
+        rc = cli.main(["execute", "them"])
+        assert rc == 0
+        assert not self._session_file(tmp_path).exists()
+        assert captured["extra_context"] is None
+
+    def test_followup_injects_prior_turn(self, monkeypatch, tmp_path):
+        self._isolate(monkeypatch, tmp_path)
+        captured = {}
+        self._fake_generate(monkeypatch, captured, ["ls *.py | head -3"])
+        cli.main(["--session", "list", "three", "python", "files", "here"])
+        self._fake_generate(monkeypatch, captured, ["rm one.py"])
+        rc = cli.main(["--session", "delete", "them"])
+        assert rc == 0
+        assert captured["extra_context"] == (
+            'Prior: "list three python files here" -> ls *.py | head -3')
+
+    def test_non_anaphoric_gets_no_context_but_still_records(
+            self, monkeypatch, tmp_path):
+        self._isolate(monkeypatch, tmp_path)
+        captured = {}
+        self._fake_generate(monkeypatch, captured, ["ls -la"])
+        cli.main(["--session", "list", "files", "in", "this", "folder"])
+        assert captured["extra_context"] is None
+        lines = self._session_file(tmp_path).read_text().splitlines()
+        assert len(lines) == 1
+
+    def test_quiet_never_receives_context_but_records(
+            self, monkeypatch, tmp_path):
+        self._isolate(monkeypatch, tmp_path)
+        captured = {}
+        self._fake_generate(monkeypatch, captured, ["ls *.py"])
+        cli.main(["--session", "list", "python", "files"])
+        self._fake_generate(monkeypatch, captured, ["rm one.py"])
+        rc = cli.main(["--session", "-q", "execute", "them"])
+        assert rc == 0
+        assert captured["extra_context"] is None
+        assert len(self._session_file(tmp_path).read_text().splitlines()) == 2
+
+    def test_enabled_via_config_not_flag(self, monkeypatch, tmp_path):
+        self._isolate(monkeypatch, tmp_path)
+        cfg_dir = tmp_path / "cfg"
+        cfg_dir.mkdir(parents=True)
+        (cfg_dir / "config.json").write_text('{"sessions": true}')
+        captured = {}
+        self._fake_generate(monkeypatch, captured, ["ls"])
+        cli.main(["list", "python", "files"])
+        assert self._session_file(tmp_path).exists()
+
+    def test_danger_command_is_never_recorded(self, monkeypatch, tmp_path):
+        self._isolate(monkeypatch, tmp_path)
+        captured = {}
+        self._fake_generate(monkeypatch, captured, ["rm -rf /"])
+        rc = cli.main(["--session", "delete", "them"])
+        assert rc == 0
+        assert not self._session_file(tmp_path).exists()
+
+    def test_caution_command_is_recorded(self, monkeypatch, tmp_path):
+        self._isolate(monkeypatch, tmp_path)
+        captured = {}
+        self._fake_generate(monkeypatch, captured, ["chmod 777 ./build"])
+        rc = cli.main(["--session", "open", "permissions", "on", "it"])
+        assert rc == 0
+        lines = self._session_file(tmp_path).read_text().splitlines()
+        turns = [json.loads(line) for line in lines]
+        assert turns[-1]["command"] == "chmod 777 ./build"
+
+    def test_stale_session_is_reset_before_injection(self, monkeypatch, tmp_path):
+        self._isolate(monkeypatch, tmp_path)
+        data = tmp_path / "data"
+        data.mkdir(parents=True)
+        stale = time.time() - sessions_mod.TTL_SECONDS - 1
+        turn = {"ts": stale, "cwd": os.getcwd(), "nl": "old request",
+                "command": "old-cmd", "executed": False, "exit_code": None}
+        (data / "session.jsonl").write_text(json.dumps(turn) + "\n")
+        captured = {}
+        self._fake_generate(monkeypatch, captured, ["rm one.py"])
+        cli.main(["--session", "delete", "them"])
+        # Expired history must not reach the prompt. The file exists again
+        # afterwards: this very run recorded a fresh turn over the reset.
+        assert captured["extra_context"] is None
+        lines = self._session_file(tmp_path).read_text().splitlines()
+        turns = [json.loads(line) for line in lines]
+        assert [t["nl"] for t in turns] == ["delete them"]
+        assert all(t["ts"] > time.time() - 60 for t in turns)
+
+    def test_execute_overwrites_with_actual_command_and_rc(
+            self, monkeypatch, tmp_path):
+        self._isolate(monkeypatch, tmp_path)
+        cfg_dir = tmp_path / "cfg"
+        cfg_dir.mkdir(parents=True)
+        (cfg_dir / "config.json").write_text('{"confirm_execute": false}')
+
+        class _R:
+            returncode = 5
+
+        monkeypatch.setattr(cli, "_is_windows", lambda: False)
+
+        def fake_run(*a, **k):
+            return _R()
+
+        monkeypatch.setattr(cli.subprocess, "run", fake_run)
+        captured = {}
+        self._fake_generate(monkeypatch, captured, ["ls -la"])
+        rc = cli.main(["--session", "-e", "-y", "list", "files"])
+        assert rc == 5
+        lines = self._session_file(tmp_path).read_text().splitlines()
+        turns = [json.loads(line) for line in lines]
+        assert turns[-1]["executed"] is True
+        assert turns[-1]["exit_code"] == 5
+
+    def test_session_subcommand_show_and_clear(self, monkeypatch, tmp_path,
+                                               capsys):
+        self._isolate(monkeypatch, tmp_path)
+        assert cli.main(["session", "show"]) == 0
+        assert "no session stored" in capsys.readouterr().out
+        captured = {}
+        self._fake_generate(monkeypatch, captured, ["ls"])
+        cli.main(["--session", "list", "files"])
+        capsys.readouterr()
+        assert cli.main(["session", "show"]) == 0
+        out = capsys.readouterr().out
+        assert "list files" in out and "ls" in out
+        assert cli.main(["session", "clear"]) == 0
+        assert "cleared" in capsys.readouterr().out
+        assert not self._session_file(tmp_path).exists()
+
+    def test_request_containing_session_word_midway_is_a_query(self):
+        a = cli.QueryArgs(["show", "my", "session", "history"])
+        assert a.words[0] == "show"

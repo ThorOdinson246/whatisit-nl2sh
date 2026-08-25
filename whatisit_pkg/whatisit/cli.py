@@ -19,7 +19,7 @@ import sys
 from pathlib import Path
 
 from . import config as cfg_mod
-from . import engine, fetch
+from . import engine, fetch, sessions
 from .safety import check
 
 # Colour only when attached to a terminal, and honour NO_COLOR. Tracked per
@@ -131,10 +131,13 @@ def _warn_stray_flags(args) -> None:
     warn(DIM(f"        flags go first:  whatisit {first} {rest}"))
 
 
-def _emit_debug(prompt: str, system: str, user_msg: str, grammar: str | None) -> None:
+def _emit_debug(prompt: str, system: str, user_msg: str, grammar: str | None,
+                extra_context: str | None = None) -> None:
     """Print the exact prompt + grammar the model sees, for diagnosing failures."""
     warn(DIM(f"  --debug: system prompt length = {len(system)}"))
     warn(DIM(f"  --debug: grammar = {'none' if grammar is None else 'set'}"))
+    if extra_context:
+        warn(DIM(f"  --debug: session context:\n{extra_context}"))
     warn(DIM(f"  --debug: user prompt:\n{user_msg}"))
     if grammar:
         warn(DIM(f"  --debug: GBNF grammar:\n{grammar}"))
@@ -146,6 +149,20 @@ def cmd_query(args, cfg: dict) -> int:
     if not prompt:
         warn("whatisit: nothing to do -- give me a request in plain English")
         return 2
+
+    # Session memory is opt-in (config sessions=true, or --session for one
+    # run). Loading validates TTL/cwd and resets a dead session even when
+    # nothing will be injected; turns are recorded regardless so a
+    # self-contained first request can seed a later follow-up. Injection
+    # additionally requires a non-quiet run (-q output must stay deterministic
+    # and self-contained for $(...) use) and an anaphoric request, so ordinary
+    # queries get byte-identical prompts to before. See sessions.py.
+    sessions_on = bool(cfg.get("sessions")) or getattr(args, "session", False)
+    extra_context = None
+    if sessions_on:
+        turns = sessions.load_valid()
+        if turns and not args.quiet and sessions.looks_anaphoric(prompt):
+            extra_context = sessions.history_block(turns)
 
     # Per-invocation overrides from CLI flags. These win over the saved config
     # file but do not persist to it (that is `whatisit config --set`'s job).
@@ -166,7 +183,8 @@ def cmd_query(args, cfg: dict) -> int:
         # (if any). Intended for diagnosing why the 1.5B model misbehaves; goes
         # to stderr so `-q` output is unaffected.
         system, user_msg = engine.hostctx.build(prompt,
-                                                enabled=cfg.get("host_context", True))
+                                                enabled=cfg.get("host_context", True),
+                                                extra_context=extra_context)
         pkg = "unknown"
         grammar = None
         if cfg.get("host_context", True) and cfg.get("use_grammar", True):
@@ -176,7 +194,8 @@ def cmd_query(args, cfg: dict) -> int:
                 pass
             if pkg != "unknown" and hasattr(engine.hostctx, "grammar_for_pkg"):
                 grammar = engine.hostctx.grammar_for_pkg(pkg)
-        _emit_debug(prompt, system, user_msg, grammar)
+        _emit_debug(prompt, system, user_msg, grammar,
+                    extra_context=extra_context)
 
     # Remote mode sends the request (and host context, if enabled) somewhere
     # else, which is the one thing this tool otherwise promises never to do.
@@ -189,7 +208,8 @@ def cmd_query(args, cfg: dict) -> int:
     try:
         cmds, elapsed, mode = engine.generate(
             prompt, cfg, n=args.num, force_oneshot=args.oneshot, quiet=args.quiet,
-            for_execution=args.execute or args.quiet)
+            for_execution=args.execute or args.quiet,
+            extra_context=extra_context)
     except FileNotFoundError as e:
         warn(f"whatisit: {e}")
         return 3
@@ -215,13 +235,20 @@ def cmd_query(args, cfg: dict) -> int:
         if findings:
             sys.stdout.flush()
             print_findings(findings)
+        # -q still records (stdout is untouched by it): a scripted first call
+        # is exactly the setup whose follow-up gets typed manually next.
+        if sessions_on:
+            sessions.record(prompt, cmds[0])
         _warn_stray_flags(args)
         return 0
 
+    first_danger = False
     for i, c in enumerate(cmds):
         label = f"{DIM(f'{i+1}.')} " if len(cmds) > 1 else ""
         out(f"{label}{BOLD(CYAN(c))}")
         findings = check(c)
+        if i == 0:
+            first_danger = any(sev == "DANGER" for sev, _ in findings)
         if findings:
             # The command goes to stdout and warnings to stderr (so that
             # `whatisit ... | sh` still works). Without this flush the two streams
@@ -234,6 +261,12 @@ def cmd_query(args, cfg: dict) -> int:
     # never printed after messages that refer to it.
     sys.stdout.flush()
     _warn_stray_flags(args)
+
+    # Record the turn for future follow-ups -- but NEVER one the checker
+    # flagged DANGER: stored history must not become a way to replay a
+    # dangerous command past the safety gate on a later "run it again".
+    if sessions_on and not first_danger:
+        sessions.record(prompt, cmds[0])
 
     # Opt-in only (`whatisit config --set log_queries=true`). Shell requests can
     # contain hostnames, paths and credentials, so this is never on by default
@@ -299,7 +332,13 @@ def cmd_query(args, cfg: dict) -> int:
 
     warn(DIM(f"$ {chosen}"))
     shell = os.environ.get("SHELL", "/bin/bash")
-    return subprocess.run([shell, "-c", chosen]).returncode
+    rc = subprocess.run([shell, "-c", chosen]).returncode
+    # -e can only reach this point past the DANGER refusal above, so what
+    # actually executed is always safe to remember -- and more truthful than
+    # the suggestion that was recorded before it.
+    if sessions_on:
+        sessions.update_executed(chosen, rc)
+    return rc
 
 
 def _confirm(prompt: str, auto: bool) -> bool:
@@ -676,6 +715,45 @@ def cmd_stop(args, cfg: dict) -> int:
     return 0
 
 
+def cmd_session(args, cfg: dict) -> int:
+    """Inspect or wipe stored follow-up context (format in sessions.py).
+
+    show prints what is on disk, stale turns included: this is an audit view
+    of the file, not a preview -- whether a turn would actually be injected
+    is decided per query by load_valid (TTL, cwd) and looks_anaphoric.
+    """
+    if args.action == "clear":
+        print("whatisit: session cleared." if sessions.clear()
+              else "whatisit: no session stored.")
+        return 0
+    turns = sessions.show()
+    if not turns:
+        print("whatisit: no session stored.")
+        return 0
+    for i, t in enumerate(turns, 1):
+        mark = DIM(f"  [ran, exit {t.get('exit_code')}]" if t.get("executed") else "")
+        print(f"{BOLD(f'{i}.')} {t['nl']}")
+        print(f"   -> {CYAN(t['command'])}{mark}")
+    return 0
+
+
+def _cmd_session_argv(rest: list[str]) -> int:
+    """Hand-routed `session` subcommand.
+
+    argparse cannot route this one itself: the greedy `words` positional
+    (see QueryArgs) competes for the literal token "session", and with a
+    following word -- `session show` -- the word arrives at the top-level
+    sub choice instead of inside the subparser. stop/config never hit this
+    because they take no positional argument.
+    """
+    import types
+    action = rest[0] if rest else "show"
+    if action not in ("show", "clear"):
+        warn(f"whatisit: unknown session action {action!r} -- use show or clear")
+        return 2
+    return cmd_session(types.SimpleNamespace(action=action), {})
+
+
 def cmd_config(args, cfg: dict) -> int:
     if args.set:
         for kv in args.set:
@@ -728,6 +806,9 @@ def build_parser() -> argparse.ArgumentParser:
                     help="bypass the resident server (slower; for debugging)")
     ap.add_argument("-y", "--yes", action="store_true",
                     help="with -e, treat an empty confirm answer as yes ([Y/n])")
+    ap.add_argument("--session", action="store_true",
+                    help="enable session memory for this invocation "
+                         "(lets \"execute them\" resolve against your last request)")
     ap.add_argument("--port", type=int, metavar="PORT",
                     help="fixed TCP port for the resident server (1-65535)")
     ap.add_argument("--threads", type=int, metavar="N",
@@ -768,16 +849,24 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("doctor", help="check the installation").set_defaults(func=cmd_doctor)
     sub.add_parser("stop", help="stop the resident model server").set_defaults(func=cmd_stop)
+    # Registered so `whatisit --help` lists it, but routed by hand in main()
+    # (_cmd_session_argv): argparse cannot get "session <action>" through the
+    # greedy words positional.
+    ssn = sub.add_parser("session", help="show or clear remembered follow-up context")
+    ssn.add_argument("action", nargs="?", choices=["show", "clear"], default="show",
+                     help="show prints stored turns; clear wipes them")
+    ssn.set_defaults(func=cmd_session)
     c = sub.add_parser("config", help="show or change settings")
     c.add_argument("--set", nargs="+", metavar="K=V")
     c.set_defaults(func=cmd_config)
     return ap
 
 
-SUBCOMMANDS = {"setup", "doctor", "stop", "config"}
+SUBCOMMANDS = {"setup", "doctor", "stop", "session", "config"}
 _FLAGS_NOARG = {"-e", "--execute", "-q", "--quiet", "-t", "--timing", "--oneshot",
                 "--host-context", "--no-host-context",
-                "--grammar", "--no-grammar", "--debug", "-y", "--yes"}
+                "--grammar", "--no-grammar", "--debug", "-y", "--yes",
+                "--session"}
 _FLAGS_ARG = {"-n", "--num"}
 _FLAGS_QUERY_ARG = {"--port", "--threads", "--ctx-size", "--model"}
 
@@ -801,6 +890,7 @@ class QueryArgs:
         self.timing, self.oneshot = False, False
         self.port, self.threads, self.ctx_size, self.model = None, None, None, None
         self.host_context, self.grammar, self.debug, self.yes = None, None, False, False
+        self.session = False
         i = 0
         while i < len(argv):
             a = argv[i]
@@ -823,6 +913,7 @@ class QueryArgs:
                                    "-q": "quiet", "--quiet": "quiet",
                                    "-t": "timing", "--timing": "timing",
                                    "--oneshot": "oneshot",
+                                   "--session": "session",
                                    "--debug": "debug"}[a], True)
             elif a in _FLAGS_ARG:
                 if i + 1 >= len(argv):
@@ -887,6 +978,8 @@ def main(argv=None) -> int:
     # `whatisit config` manages settings while `whatisit show me the git config`
     # stays a question.
     if argv[0] in SUBCOMMANDS:
+        if argv[0] == "session":
+            return _cmd_session_argv(argv[1:])
         args = build_parser().parse_args(argv)
         return args.func(args, cfg)
 

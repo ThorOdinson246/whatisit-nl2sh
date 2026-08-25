@@ -110,6 +110,11 @@ DEFAULTS = {
     "force_tcp": False,
     "server_port": None,       # fixed TCP port for the resident server
     "ctx_size": 2048,          # context size passed to llama-server/llama-cli
+    # OFF by default: cross-invocation memory ("execute them") writes requests
+    # to disk and changes prompts, so it is strictly opt-in (--session or
+    # sessions=true). Injection is further gated on anaphora detection; see
+    # sessions.py.
+    "sessions": False,
 }
 
 

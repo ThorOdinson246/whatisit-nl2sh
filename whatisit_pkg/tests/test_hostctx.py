@@ -820,3 +820,53 @@ class TestPostprocess:
     def test_multi_package_install(self):
         got = hostctx.postprocess_command("apt-get install htop nmon", "pacman")
         assert got == "pacman -S htop nmon"
+
+
+# ------------------------------------------------- build(): session context
+
+class TestBuildExtraContext:
+    """Session history (extra_context) is independent of both host-context
+    switches and must sit immediately before the <request> tag. None must
+    leave every output byte-identical to before the feature existed."""
+
+    FACTS = {"distro": "Ubuntu", "distro_version": "22.04", "arch": "x86_64",
+             "shell": "bash", "pkg": "apt", "present": ["git"], "missing": []}
+
+    @pytest.fixture(autouse=True)
+    def _no_probe(self, monkeypatch):
+        monkeypatch.setattr(hostctx, "stable_facts", lambda: self.FACTS)
+        monkeypatch.setattr(hostctx, "_git_state", lambda cwd: "")
+
+    BLOCK = 'Prior: "list py files" -> ls'
+
+    def test_none_is_byte_identical_in_all_switch_combos(self, tmp_path):
+        for enabled in (False, True):
+            for volatile in (False, True):
+                assert (hostctx.build("do a thing", enabled=enabled,
+                                      cwd=tmp_path, include_volatile=volatile)
+                        == hostctx.build("do a thing", enabled=enabled,
+                                         cwd=tmp_path, include_volatile=volatile,
+                                         extra_context=None))
+
+    def test_sits_between_volatile_block_and_request_tag(self, tmp_path):
+        _, user = hostctx.build("delete them", enabled=True, cwd=tmp_path,
+                                include_volatile=True, extra_context=self.BLOCK)
+        vol = hostctx.volatile_block(tmp_path)
+        assert user == (f"{vol}\n\n{self.BLOCK}"
+                        "\n\n<request>\ndelete them\n</request>")
+
+    def test_survives_include_volatile_false(self):
+        # -e withholds ambient directory facts but must keep history: the
+        # whole point is resolving "them" against the previous turn.
+        system, user = hostctx.build("delete them", enabled=True,
+                                     include_volatile=False,
+                                     extra_context=self.BLOCK)
+        assert user == f"{self.BLOCK}\n\ndelete them"
+
+    def test_works_with_host_context_disabled(self):
+        # The two features are independently switchable: sessions=true with
+        # host_context=false must still inject, on the bare-prompt path.
+        system, user = hostctx.build("delete them", enabled=False,
+                                     extra_context=self.BLOCK)
+        assert system == cfg_mod.SYSTEM_PROMPT
+        assert user == f"{self.BLOCK}\n\ndelete them"

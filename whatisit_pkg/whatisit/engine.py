@@ -957,11 +957,14 @@ def _collect_commands(raws, host_pkg: str = "unknown") -> list[str]:
 
 
 def generate(prompt: str, cfg: dict, n: int = 1, force_oneshot: bool = False,
-             quiet: bool = False, for_execution: bool = False) -> tuple[list[str], float, str]:
+             quiet: bool = False, for_execution: bool = False,
+             extra_context: str | None = None) -> tuple[list[str], float, str]:
     """Return (commands, elapsed_seconds, mode). Commands are already extracted.
 
     mode is one of "remote", "server", or "oneshot". Remote mode is selected by
     a configured OpenAI-compatible base URL and needs no local model at all.
+    extra_context is preformatted session history (sessions.history_block);
+    the gating decision lives in the CLI so this stays a pure transport.
     """
     remote = cfg_mod.remote_config(cfg)
     if remote is not None:
@@ -975,9 +978,13 @@ def generate(prompt: str, cfg: dict, n: int = 1, force_oneshot: bool = False,
         # -e and -q feed a shell. The volatile block carries filenames from the
         # cwd, which the user did not type, so it is withheld from the two
         # flows whose output can run. Ordinary suggestions still get it.
+        # Session history is the deliberate exception for -e: "delete them"
+        # must resolve against the prior turn, and every executed command
+        # still passes the same safety gate. -q stays context-free.
         system, user_msg = hostctx.build(
             prompt, enabled=cfg.get("host_context", True),
-            include_volatile=not (for_execution or quiet))
+            include_volatile=not (for_execution or quiet),
+            extra_context=extra_context)
         t0 = time.time()
         raws = _query_remote(remote, user_msg, cfg, n, system=system)
         return _collect_commands(raws), time.time() - t0, "remote"
@@ -1002,7 +1009,8 @@ def generate(prompt: str, cfg: dict, n: int = 1, force_oneshot: bool = False,
     # placeholder / wrong-tool failures. cfg["host_context"]=false disables it.
     system, user_msg = hostctx.build(
         prompt, enabled=cfg.get("host_context", True),
-        include_volatile=not (for_execution or quiet))
+        include_volatile=not (for_execution or quiet),
+        extra_context=extra_context)
 
     # GBNF grammar + distro-aware postprocessing: constrain install verbs to the
     # host's package manager and rewrite any wrong-distro syntax as a backstop.

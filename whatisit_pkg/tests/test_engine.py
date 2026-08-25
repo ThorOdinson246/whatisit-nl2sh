@@ -595,8 +595,10 @@ class TestGenerateDiscardsTruncatedCandidates:
 
         class CaptureHostCtx:
             @staticmethod
-            def build(prompt, enabled=True, cwd=None, include_volatile=True):
+            def build(prompt, enabled=True, cwd=None, include_volatile=True,
+                      extra_context=None):
                 captured["include_volatile"] = include_volatile
+                captured["extra_context"] = extra_context
                 return ("SYSTEM PROMPT", prompt)
 
             @staticmethod
@@ -720,7 +722,8 @@ class TestServerOverridesReachTheBoundary:
 
 class _FakeHostCtx:
     @staticmethod
-    def build(prompt, enabled=True, cwd=None, include_volatile=True):
+    def build(prompt, enabled=True, cwd=None, include_volatile=True,
+              extra_context=None):
         return ("SYSTEM PROMPT", prompt)
     @staticmethod
     def stable_facts():
@@ -957,7 +960,8 @@ class TestGenerateRemote:
     def _enable_remote(self, monkeypatch, remote):
         monkeypatch.setattr(cfg_mod, "remote_config", lambda cfg: remote)
         monkeypatch.setattr(engine.hostctx, "build",
-                            lambda p, enabled=True, cwd=None, include_volatile=True: ("SYS", p))
+                            lambda p, enabled=True, cwd=None, include_volatile=True,
+                    extra_context=None: ("SYS", p))
 
     @pytest.mark.parametrize("kwargs", [{"quiet": True}, {"for_execution": True}])
     def test_remote_execution_paths_suppress_volatile_host_context(
@@ -966,8 +970,10 @@ class TestGenerateRemote:
         monkeypatch.setattr(cfg_mod, "remote_config", lambda cfg: remote)
         captured = {}
 
-        def capture_context(prompt, enabled=True, cwd=None, include_volatile=True):
+        def capture_context(prompt, enabled=True, cwd=None, include_volatile=True,
+                                extra_context=None):
             captured["include_volatile"] = include_volatile
+            captured["extra_context"] = extra_context
             return ("SYS", prompt)
 
         monkeypatch.setattr(engine.hostctx, "build", capture_context)
@@ -1057,7 +1063,8 @@ class TestGenerateGrammarAndPostprocess:
 
         class FakeHost:
             @staticmethod
-            def build(prompt, enabled=True, cwd=None, include_volatile=True):
+            def build(prompt, enabled=True, cwd=None, include_volatile=True,
+                      extra_context=None):
                 return ("SYS", prompt)
             @staticmethod
             def stable_facts():
@@ -1088,7 +1095,8 @@ class TestGenerateGrammarAndPostprocess:
         self._fake_cfg_and_model(monkeypatch, tmp_path)
         # Drive postprocessing with the real implementation, pinned to pacman.
         monkeypatch.setattr(engine.hostctx, "build",
-                            lambda p, enabled=True, cwd=None, include_volatile=True: ("SYS", p))
+                            lambda p, enabled=True, cwd=None, include_volatile=True,
+                    extra_context=None: ("SYS", p))
         monkeypatch.setattr(engine.hostctx, "stable_facts",
                             lambda *a, **k: {"pkg": "pacman"})
         monkeypatch.setattr(engine.hostctx, "grammar_for_pkg",
@@ -1130,3 +1138,104 @@ class TestGenerateGrammarAndPostprocess:
         for flag in ("--file", "--system-prompt-file", "--grammar-file"):
             path = cmd[cmd.index(flag) + 1]
             assert not os.path.exists(path)
+
+
+# ---------------------------------------------- generate(): session context
+
+class TestSessionContextForwarding:
+    """generate() must forward preformatted session history into the user
+    message on every backend path (the gating decision lives in the CLI)."""
+
+    def _fake_cfg_and_model(self, monkeypatch, tmp_path):
+        model = tmp_path / "model.gguf"
+        model.write_bytes(b"fake")
+        monkeypatch.setattr(cfg_mod, "find_model", lambda: model)
+        srv = tmp_path / "llama-server"
+        srv.write_bytes(b"fake")
+        monkeypatch.setenv("WHATISIT_LLAMA_SERVER", str(srv))
+        monkeypatch.setattr(engine, "start_server", lambda *a, **kw: 12345)
+
+    @staticmethod
+    def _capture_hostctx(monkeypatch, captured):
+        class CaptureHostCtx:
+            @staticmethod
+            def build(prompt, enabled=True, cwd=None, include_volatile=True,
+                      extra_context=None):
+                captured["system"] = "SYSTEM PROMPT"
+                captured["user_msg"] = \
+                    (f"[{extra_context}] " if extra_context else "") + prompt
+                return captured["system"], captured["user_msg"]
+
+            @staticmethod
+            def stable_facts():
+                return {"pkg": "unknown"}
+
+            @staticmethod
+            def postprocess_command(cmd, pkg_mgr):
+                return cmd
+
+            @staticmethod
+            def grammar_for_pkg(pkg_mgr):
+                return None
+
+            @staticmethod
+            def is_install_request(prompt):
+                return False
+
+        monkeypatch.setattr(engine, "hostctx", CaptureHostCtx())
+
+    @staticmethod
+    def _capture_query_server(monkeypatch, captured):
+        def fake_query_server(port, prompt, cfg, n, system=None, grammar=None):
+            captured["sent_prompt"] = prompt
+            return [("ls -la", "stop")]
+        monkeypatch.setattr(engine, "_query_server", fake_query_server)
+
+    def test_extra_context_reaches_the_user_message(self, monkeypatch, tmp_path):
+        self._fake_cfg_and_model(monkeypatch, tmp_path)
+        captured = {}
+        self._capture_hostctx(monkeypatch, captured)
+        self._capture_query_server(monkeypatch, captured)
+        engine.generate("delete them", {}, extra_context='Prior: "list py" -> ls')
+        assert 'Prior: "list py" -> ls' in captured["sent_prompt"]
+        assert captured["sent_prompt"].startswith("[Prior:")
+
+    def test_none_extra_context_is_byte_identical(self, monkeypatch, tmp_path):
+        self._fake_cfg_and_model(monkeypatch, tmp_path)
+        captured = {}
+        self._capture_hostctx(monkeypatch, captured)
+        self._capture_query_server(monkeypatch, captured)
+        engine.generate("list files", {})
+        baseline = (captured["system"], captured["sent_prompt"])
+        engine.generate("list files", {}, extra_context=None)
+        assert (captured["system"], captured["sent_prompt"]) == baseline
+
+    def test_remote_backend_receives_it_too(self, monkeypatch):
+        monkeypatch.setattr(cfg_mod, "remote_config",
+                            lambda cfg: {"base_url": "http://h/v1",
+                                         "api_key": "", "model": "m",
+                                         "timeout": 5, "max_tokens": 64})
+        captured = {}
+
+        def fake_remote_post(base, model, api_key, body, timeout=120.0):
+            captured.update(body)
+            return [("ls -la", "stop")]
+
+        monkeypatch.setattr(engine, "_remote_post", fake_remote_post)
+
+        class CaptureHostCtx:
+            @staticmethod
+            def build(prompt, enabled=True, cwd=None, include_volatile=True,
+                      extra_context=None):
+                user = (f"[{extra_context}] " if extra_context else "") + prompt
+                return ("SYSTEM PROMPT", user)
+
+            @staticmethod
+            def stable_facts():
+                return {"pkg": "unknown"}
+
+        monkeypatch.setattr(engine, "hostctx", CaptureHostCtx())
+        engine.generate("delete them", {},
+                        extra_context='Prior: "list py" -> ls')
+        msgs = {m["role"]: m["content"] for m in captured["messages"]}
+        assert "Prior:" in msgs["user"]

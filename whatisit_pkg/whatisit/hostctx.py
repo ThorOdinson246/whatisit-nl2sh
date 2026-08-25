@@ -517,13 +517,30 @@ def grammar_for_pkg(pkg_mgr: str) -> str | None:
 
 
 def build(prompt: str, enabled: bool = True, cwd: Path | None = None,
-          include_volatile: bool = True) -> tuple[str, str]:
-    """Return (system_prompt, user_message) with context folded in."""
+          include_volatile: bool = True,
+          extra_context: str | None = None) -> tuple[str, str]:
+    """Return (system_prompt, user_message) with context folded in.
+
+    extra_context carries session history (sessions.history_block). It is
+    independent of both switches: unlike volatile facts it survives
+    include_volatile=False, because "-e delete them" must resolve "them"
+    against the previous turn while still never seeing the directory listing;
+    and unlike host context it is not switched off by enabled=False. It is
+    placed immediately before the <request> tag (or directly ahead of a bare
+    prompt on the unwrapped paths). None leaves every output byte-identical.
+    """
     if not enabled:
+        if extra_context:
+            return cfg_mod.SYSTEM_PROMPT, extra_context + "\n\n" + prompt
         return cfg_mod.SYSTEM_PROMPT, prompt
     system = cfg_mod.SYSTEM_PROMPT + "\n\n" + stable_block()
     if include_volatile:
-        user = volatile_block(cwd) + "\n\n<request>\n" + prompt + "\n</request>"
+        body = volatile_block(cwd)
+        if extra_context:
+            body = body + "\n\n" + extra_context
+        user = body + "\n\n<request>\n" + prompt + "\n</request>"
+    elif extra_context:
+        user = extra_context + "\n\n" + prompt
     else:
         user = prompt
     return system, user
