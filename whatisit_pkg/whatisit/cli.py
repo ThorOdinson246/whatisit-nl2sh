@@ -265,7 +265,11 @@ def cmd_query(args, cfg: dict) -> int:
     # Record the turn for future follow-ups -- but NEVER one the checker
     # flagged DANGER: stored history must not become a way to replay a
     # dangerous command past the safety gate on a later "run it again".
-    if sessions_on and not first_danger:
+    # The flag doubles as the gate for update_executed below: when this run
+    # recorded nothing, turns[-1] belongs to a previous invocation and must
+    # not be rewritten with this run's executed command.
+    recorded = sessions_on and not first_danger
+    if recorded:
         sessions.record(prompt, cmds[0])
 
     # Opt-in only (`whatisit config --set log_queries=true`). Shell requests can
@@ -335,8 +339,9 @@ def cmd_query(args, cfg: dict) -> int:
     rc = subprocess.run([shell, "-c", chosen]).returncode
     # -e can only reach this point past the DANGER refusal above, so what
     # actually executed is always safe to remember -- and more truthful than
-    # the suggestion that was recorded before it.
-    if sessions_on:
+    # the suggestion that was recorded before it. Gated on `recorded`: see
+    # the comment at the recording site.
+    if recorded:
         sessions.update_executed(chosen, rc)
     return rc
 

@@ -838,6 +838,7 @@ class TestBuildExtraContext:
         monkeypatch.setattr(hostctx, "_git_state", lambda cwd: "")
 
     BLOCK = 'Prior: "list py files" -> ls'
+    WRAPPED = f"<prior_turns>\n{BLOCK}\n</prior_turns>"
 
     def test_none_is_byte_identical_in_all_switch_combos(self, tmp_path):
         for enabled in (False, True):
@@ -852,7 +853,7 @@ class TestBuildExtraContext:
         _, user = hostctx.build("delete them", enabled=True, cwd=tmp_path,
                                 include_volatile=True, extra_context=self.BLOCK)
         vol = hostctx.volatile_block(tmp_path)
-        assert user == (f"{vol}\n\n{self.BLOCK}"
+        assert user == (f"{vol}\n\n{self.WRAPPED}"
                         "\n\n<request>\ndelete them\n</request>")
 
     def test_survives_include_volatile_false(self):
@@ -861,7 +862,7 @@ class TestBuildExtraContext:
         system, user = hostctx.build("delete them", enabled=True,
                                      include_volatile=False,
                                      extra_context=self.BLOCK)
-        assert user == f"{self.BLOCK}\n\ndelete them"
+        assert user == f"{self.WRAPPED}\n\ndelete them"
 
     def test_works_with_host_context_disabled(self):
         # The two features are independently switchable: sessions=true with
@@ -869,4 +870,4 @@ class TestBuildExtraContext:
         system, user = hostctx.build("delete them", enabled=False,
                                      extra_context=self.BLOCK)
         assert system == cfg_mod.SYSTEM_PROMPT
-        assert user == f"{self.BLOCK}\n\ndelete them"
+        assert user == f"{self.WRAPPED}\n\ndelete them"

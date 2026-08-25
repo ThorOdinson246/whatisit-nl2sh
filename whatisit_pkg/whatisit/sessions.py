@@ -156,7 +156,14 @@ def load_valid() -> list[dict]:
     fresh = False
     if turns:
         last = turns[-1]
-        if time.time() - float(last.get("ts", 0)) > TTL_SECONDS:
+        # float(None)/float("abc") must not escape here: one malformed line
+        # would abort every session-enabled query until the file was deleted
+        # by hand. An unreadable timestamp is by definition not a live turn.
+        try:
+            age = time.time() - float(last.get("ts", 0))
+        except (TypeError, ValueError):
+            age = TTL_SECONDS + 1
+        if age > TTL_SECONDS:
             fresh = True
         elif _norm_cwd(last.get("cwd")) != _norm_cwd(os.getcwd()):
             fresh = True
@@ -191,8 +198,10 @@ def record(nl: str, command: str) -> None:
 
 def update_executed(command: str, exit_code: int) -> None:
     """Overwrite the newest turn after -e runs it, recording what actually
-    executed and how it fared. No-op when nothing was recorded -- e.g. the
-    newest generation was DANGER-flagged and skipped."""
+    executed and how it fared. Mutates turns[-1] unconditionally, so the
+    caller must gate this on having recorded a turn for the CURRENT
+    invocation -- otherwise a DANGER-skipped run would rewrite the previous
+    invocation's turn with a command it never produced."""
     turns = _read_turns()
     if not turns:
         return

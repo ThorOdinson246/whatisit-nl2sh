@@ -219,6 +219,15 @@ class TestInvalidation:
         assert sessions.load_valid() == []
         assert not p.exists()
 
+    @pytest.mark.parametrize("bad_ts", [None, "not-a-number", [], {}])
+    def test_unparseable_timestamp_resets_instead_of_raising(self, iso, bad_ts):
+        # _read_turns only validates nl/command as strings; a hand-edited or
+        # half-written ts must kill the session, never crash every
+        # session-enabled query until the file is deleted by hand.
+        _seed(iso, [_turn(ts=bad_ts)])
+        assert sessions.load_valid() == []
+        assert not (iso / "session.jsonl").exists()
+
 
 # ----------------------------------------------------------------- anaphora
 

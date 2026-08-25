@@ -516,31 +516,45 @@ def grammar_for_pkg(pkg_mgr: str) -> str | None:
     return PKG_MGR_GRAMMARS.get(pkg_mgr)
 
 
+def _wrap_prior(block: str) -> str:
+    """Tag the session block like every other context block.
+
+    History contains model-generated command text that was written to disk
+    and is fed back into a later prompt. Bare, it reads as loose instruction
+    text and a stored command that itself contains 'Prior:' could blur the
+    block boundary; inside <prior_turns> it is marked as data, for about ten
+    tokens of overhead.
+    """
+    return f"<prior_turns>\n{block}\n</prior_turns>"
+
+
 def build(prompt: str, enabled: bool = True, cwd: Path | None = None,
           include_volatile: bool = True,
           extra_context: str | None = None) -> tuple[str, str]:
     """Return (system_prompt, user_message) with context folded in.
 
-    extra_context carries session history (sessions.history_block). It is
-    independent of both switches: unlike volatile facts it survives
-    include_volatile=False, because "-e delete them" must resolve "them"
-    against the previous turn while still never seeing the directory listing;
-    and unlike host context it is not switched off by enabled=False. It is
-    placed immediately before the <request> tag (or directly ahead of a bare
-    prompt on the unwrapped paths). None leaves every output byte-identical.
+    extra_context carries session history (sessions.history_block, bare
+    lines; this module owns the envelope). It is independent of both
+    switches: unlike volatile facts it survives include_volatile=False,
+    because "-e delete them" must resolve "them" against the previous turn
+    while still never seeing the directory listing; and unlike host context
+    it is not switched off by enabled=False. It is wrapped in
+    <prior_turns> and placed immediately before the <request> tag (or
+    directly ahead of a bare prompt on the unwrapped paths). None leaves
+    every output byte-identical.
     """
     if not enabled:
         if extra_context:
-            return cfg_mod.SYSTEM_PROMPT, extra_context + "\n\n" + prompt
+            return cfg_mod.SYSTEM_PROMPT, _wrap_prior(extra_context) + "\n\n" + prompt
         return cfg_mod.SYSTEM_PROMPT, prompt
     system = cfg_mod.SYSTEM_PROMPT + "\n\n" + stable_block()
     if include_volatile:
         body = volatile_block(cwd)
         if extra_context:
-            body = body + "\n\n" + extra_context
+            body = body + "\n\n" + _wrap_prior(extra_context)
         user = body + "\n\n<request>\n" + prompt + "\n</request>"
     elif extra_context:
-        user = extra_context + "\n\n" + prompt
+        user = _wrap_prior(extra_context) + "\n\n" + prompt
     else:
         user = prompt
     return system, user

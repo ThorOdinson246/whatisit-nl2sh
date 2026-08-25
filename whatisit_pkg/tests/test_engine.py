@@ -1162,6 +1162,7 @@ class TestSessionContextForwarding:
             def build(prompt, enabled=True, cwd=None, include_volatile=True,
                       extra_context=None):
                 captured["system"] = "SYSTEM PROMPT"
+                captured["extra_context"] = extra_context
                 captured["user_msg"] = \
                     (f"[{extra_context}] " if extra_context else "") + prompt
                 return captured["system"], captured["user_msg"]
@@ -1201,14 +1202,19 @@ class TestSessionContextForwarding:
         assert captured["sent_prompt"].startswith("[Prior:")
 
     def test_none_extra_context_is_byte_identical(self, monkeypatch, tmp_path):
+        # The forwarding contract lives in generate(): with no history, the
+        # kwarg must arrive as None and the prompt must be the bare request.
         self._fake_cfg_and_model(monkeypatch, tmp_path)
         captured = {}
         self._capture_hostctx(monkeypatch, captured)
         self._capture_query_server(monkeypatch, captured)
         engine.generate("list files", {})
-        baseline = (captured["system"], captured["sent_prompt"])
+        assert captured["extra_context"] is None
+        baseline = captured["sent_prompt"]
+        assert baseline == "list files"
         engine.generate("list files", {}, extra_context=None)
-        assert (captured["system"], captured["sent_prompt"]) == baseline
+        assert captured["extra_context"] is None
+        assert captured["sent_prompt"] == baseline
 
     def test_remote_backend_receives_it_too(self, monkeypatch):
         monkeypatch.setattr(cfg_mod, "remote_config",

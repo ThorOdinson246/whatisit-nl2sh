@@ -577,7 +577,13 @@ class TestSessionMemory:
         stale = time.time() - sessions_mod.TTL_SECONDS - 1
         turn = {"ts": stale, "cwd": os.getcwd(), "nl": "old request",
                 "command": "old-cmd", "executed": False, "exit_code": None}
-        (data / "session.jsonl").write_text(json.dumps(turn) + "\n")
+        seed = data / "session.jsonl"
+        seed.write_text(json.dumps(turn) + "\n")
+        # Seed at 0600 or the permission rule resets the file before the
+        # stale timestamp is ever consulted -- this test pins the TTL rule,
+        # not the perms rule (which has its own tests).
+        if os.name != "nt":
+            os.chmod(seed, 0o600)
         captured = {}
         self._fake_generate(monkeypatch, captured, ["rm one.py"])
         cli.main(["--session", "delete", "them"])
@@ -613,6 +619,43 @@ class TestSessionMemory:
         turns = [json.loads(line) for line in lines]
         assert turns[-1]["executed"] is True
         assert turns[-1]["exit_code"] == 5
+
+    def test_danger_top_candidate_never_rewrites_the_previous_turn(
+            self, monkeypatch, tmp_path):
+        # Regression: with -n 2 whose greedy candidate is DANGER, nothing is
+        # recorded for this run -- so executing the safe alternative must
+        # NOT rewrite turns[-1], which still belongs to the prior invocation.
+        self._isolate(monkeypatch, tmp_path)
+        cfg_dir = tmp_path / "cfg"
+        cfg_dir.mkdir(parents=True)
+        (cfg_dir / "config.json").write_text('{"confirm_execute": false}')
+        monkeypatch.setattr(cli, "_is_windows", lambda: False)
+
+        class _R:
+            returncode = 0
+
+        monkeypatch.setattr(cli.subprocess, "run", lambda *a, **k: _R())
+        captured = {}
+        self._fake_generate(monkeypatch, captured, ["ls *.py"])
+        cli.main(["--session", "list", "python", "files"])
+
+        # This run: candidate 1 flagged DANGER ("rm -rf /" is a critical
+        # path), candidate 2 executable.
+        def fake_generate2(prompt, cfg, n=1, force_oneshot=False, quiet=False,
+                           for_execution=False, extra_context=None):
+            captured["prompt"] = prompt
+            return (["rm -rf /", "rm ./tmp.log"], 0.01, "server")
+        monkeypatch.setattr(cli.engine, "generate", fake_generate2)
+        monkeypatch.setattr(cli.sys.stdin, "isatty", lambda: True)
+        monkeypatch.setattr("builtins.input", lambda *a: "2")
+        rc = cli.main(["--session", "-e", "clean", "this", "up"])
+        assert rc == 0
+        lines = self._session_file(tmp_path).read_text().splitlines()
+        turns = [json.loads(line) for line in lines]
+        assert len(turns) == 1
+        assert turns[0]["nl"] == "list python files"
+        assert turns[0]["command"] == "ls *.py"
+        assert turns[0]["executed"] is False
 
     def test_session_subcommand_show_and_clear(self, monkeypatch, tmp_path,
                                                capsys):
