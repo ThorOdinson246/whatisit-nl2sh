@@ -12,6 +12,7 @@ None of this starts a server or touches the network: engine.generate is
 monkeypatched wherever cmd_query would otherwise call into it.
 """
 import os
+from types import SimpleNamespace
 
 import pytest
 
@@ -168,6 +169,25 @@ class TestCmdQueryQuietDangerRefusal:
         monkeypatch.setattr(cli, "_is_windows", lambda: False)
         assert cli.main(["-e", "list", "files"]) == 6
         assert captured["for_execution"] is True
+
+    def test_execute_refuses_a_danger_command_and_never_runs_it(
+            self, monkeypatch, capsys):
+        # Inverting `if danger:` used to leave the whole suite green. Everything
+        # downstream is set up to say yes, so only the refusal stops the run.
+        ran = []
+        monkeypatch.setattr(cli, "_is_windows", lambda: False)
+        monkeypatch.setattr(cli.sys.stdin, "isatty", lambda: True)
+        monkeypatch.setattr("builtins.input", lambda *a: "y")
+        monkeypatch.setattr(cli.subprocess, "run",
+                            lambda argv, **kw: (ran.append(argv),
+                                                SimpleNamespace(returncode=0))[1])
+        monkeypatch.setattr(
+            cli.engine, "generate",
+            lambda prompt, cfg, n=1, force_oneshot=False, quiet=False, for_execution=False:
+                (["rm -rf /"], 0.01, "server"))
+        assert cli.main(["-e", "-y", "delete", "everything"]) == 6
+        assert ran == []
+        assert "DANGER" in capsys.readouterr().err
 
     def test_no_model_found_reports_and_exits_3(self, monkeypatch):
         def raise_not_found(prompt, cfg, n=1, force_oneshot=False, quiet=False,
