@@ -123,6 +123,20 @@ whatisit -e remove every .pyc file under this tree
 `whatisit stop` shuts down the resident model server. `whatisit config --set threads=4`
 changes settings.
 
+### Unloading the model automatically
+
+The resident server holds the model in RAM. On a tight box, have it unload
+itself once it has been idle for a while:
+
+```bash
+whatisit --idle-timeout 300 show disk usage   # this invocation only
+whatisit config --set idle_timeout=300        # persist it (0 = never, default)
+```
+
+A watchdog stops the server at the deadline and frees the memory it was
+holding; the next query pays a cold start. The deadline is re-armed on every
+query, including one still running.
+
 ## Remote endpoints
 
 To use a hosted API, Ollama, or a `llama.cpp` server you already have running:

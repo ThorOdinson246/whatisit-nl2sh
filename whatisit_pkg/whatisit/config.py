@@ -110,6 +110,12 @@ DEFAULTS = {
     "force_tcp": False,
     "server_port": None,       # fixed TCP port for the resident server
     "ctx_size": 2048,          # context size passed to llama-server/llama-cli
+    # 0 => never auto-unload. When > 0, a detached watchdog stops the resident
+    # server after this many idle seconds, freeing its RAM without waiting for
+    # the next query. See engine.touch_last_use() and watchdog.py.
+    # Never passed to llama-server itself (CVE-2026-43631 in builds b7492-b9060
+    # is triggered by its native --sleep-idle-seconds flag).
+    "idle_timeout": 0,
 }
 
 

@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import http.client
 import json
+import math
 import os
 import re
 import secrets
@@ -31,10 +32,12 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from contextlib import contextmanager
 from pathlib import Path
 
 from . import config as cfg_mod
@@ -210,6 +213,175 @@ def _port_file() -> Path:
 
 def _params_file() -> Path:
     return _state_dir() / "server.params"
+
+
+def _last_use_path() -> Path:
+    return _state_dir() / "server.last_use"
+
+
+def _watch_path() -> Path:
+    # Watchdog instructions: just the deadline, re-read every tick, so
+    # changing --idle-timeout reaches a live watchdog without a restart.
+    return _state_dir() / "server.watch"
+
+
+def _coerce_idle_timeout(v) -> int | None:
+    """Coerce persisted idle_timeout to int, or None if disabled/invalid.
+
+    Invalid persisted values (e.g. ``"tomorrow"``) must not crash queries.
+    """
+    if v is None:
+        return None
+    try:
+        iv = int(v)
+    except (TypeError, ValueError):
+        return None
+    if iv <= 0:
+        return None
+    return iv
+
+
+def touch_last_use(idle_timeout) -> None:
+    """Record now as the server's last use, but only when idle timeout is on.
+
+    Called before and after a successful server-mode query. When the feature
+    is off (idle_timeout <= 0 or invalid) nothing is written, so the file
+    never exists and the idle checks are no-ops.
+    """
+    if _coerce_idle_timeout(idle_timeout) is None:
+        return
+    _touch_now()
+
+
+def _touch_now() -> None:
+    """Atomically publish the activity timestamp.
+
+    Truncate-then-write leaves a window where readers (watchdog tick,
+    idle_stop, this very heartbeat racing a query) see an EMPTY file -- a
+    torn read that reads as 'no data' or, at the worst moment, makes the
+    watchdog's grace reread fall through and kill a freshly-refreshed
+    server. Write to a unique temp sibling and rename: os.replace publishes
+    the new content in one step, and replacing a planted symlink swaps the
+    link rather than following it.
+    """
+    p = _last_use_path()
+    tmp = p.with_name(f".{p.name}.{os.getpid()}.{secrets.token_hex(4)}")
+    try:
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        if os.name != "nt":
+            flags |= os.O_NOFOLLOW
+        fd = os.open(str(tmp), flags, 0o600)
+        try:
+            os.fchmod(fd, 0o600)
+        except (OSError, AttributeError):
+            pass
+        with os.fdopen(fd, "w") as f:
+            f.write(f"{time.time():.6f}\n")
+        os.replace(str(tmp), str(p))
+    except OSError:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass  # a missing timestamp only means the model stays loaded longer
+
+
+@contextmanager
+def _heartbeat(idle_timeout):
+    """Refresh last_use while one inference runs.
+
+    The pre-query touch alone cannot protect an inference that outlives
+    idle_timeout: nothing updates the timestamp while _query_server blocks,
+    so a 45 s generation under --idle-timeout 30 would look idle and get
+    stopped at t=30. A daemon thread re-arms the deadline every quarter of
+    the timeout until the query returns.
+    """
+    if idle_timeout is None:
+        yield
+        return
+    interval = max(0.05, min(float(idle_timeout) / 4.0, 10.0))
+    stop = threading.Event()
+
+    def beat():
+        while not stop.wait(interval):
+            _touch_now()
+
+    t = threading.Thread(target=beat, daemon=True)
+    t.start()
+    try:
+        yield
+    finally:
+        stop.set()
+        t.join(timeout=2.0)
+
+
+def _write_watch_file(idle_timeout: int) -> None:
+    """Publish the deadline for the watchdog; see _watch_path()."""
+    try:
+        _write_private(_watch_path(), f"{int(idle_timeout)}\n")
+    except OSError:
+        pass
+
+
+def _clear_watch_state() -> None:
+    """Retract watchdog instructions and stale activity marks.
+
+    Runs when idle timeout is off: a live watchdog from an earlier
+    --idle-timeout window must exit rather than keep killing servers with the
+    deadline that was current when it spawned. Deliberately does NOT create
+    the state dir -- unlink(missing_ok=True) needs no parent, and this path
+    must stay free of filesystem side effects (sandboxed CI has no HOME).
+    """
+    run_dir = cfg_mod.data_dir() / "run"
+    for name in ("server.watch", "server.last_use"):
+        try:
+            (run_dir / name).unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def _spawn_watchdog() -> None:
+    """Spawn the detached singleton watchdog, best-effort."""
+    try:
+        kwargs = {}
+        if _is_windows():
+            kwargs["creationflags"] = (subprocess.DETACHED_PROCESS
+                                       | subprocess.CREATE_NEW_PROCESS_GROUP)
+        else:
+            kwargs["start_new_session"] = True
+        # cwd: -m puts it first on sys.path, so running from a directory
+        # holding a whatisit/ package would import that one instead.
+        subprocess.Popen([sys.executable, "-m", "whatisit.watchdog"],
+                         cwd=str(_state_dir()),
+                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL, close_fds=True, **kwargs)
+    except OSError:
+        pass  # spawning must never break the query; lazy idle_stop covers it
+
+
+def idle_stop(idle_timeout) -> bool:
+    """Stop a resident server that has been idle past its deadline.
+
+    Fallback for when the watchdog cannot run (spawn failed, platform without
+    flock, etc.). Narrower than the watchdog on purpose: with no recorded
+    last_use there is nothing to age from here, so a launched-but-never-queried
+    server is left to the watchdog, which anchors on its own start instead.
+    """
+    timeout = _coerce_idle_timeout(idle_timeout)
+    if timeout is None:
+        return False
+    sd = _state_dir()
+    p = _last_use_path()
+    if not (sd / "server.pid").exists() or not p.exists():
+        return False
+    try:
+        last = float(p.read_text().strip())
+    except (OSError, ValueError):
+        return False
+    if not math.isfinite(last):
+        return False
+    if time.time() - last < timeout:
+        return False
+    return bool(stop_server())
 
 
 def _free_port() -> int:
@@ -501,10 +673,12 @@ def _pid_gone(pid: int) -> bool:
 
 
 def _reap(pid: int) -> None:
-    """Clear the zombie if this server happens to be our own child.
+    """Clear the zombie when the server is this process's own child.
 
-    A dead-but-unreaped process still answers signal 0, so without this the
-    escalation below would never see it exit.
+    Never true on the CLI paths, where stop_server runs in a fresh process or
+    in the watchdog: it applies to the in-process restart in start_server, and
+    to the tests. A dead-but-unreaped child still answers signal 0, so without
+    this the escalation below burns the whole window and still reports failure.
     """
     try:
         os.waitpid(pid, os.WNOHANG)
@@ -523,7 +697,9 @@ def _terminate(pid: int) -> bool:
     except (ProcessLookupError, PermissionError):
         return False
     if _is_windows():
-        return True              # TerminateProcess; nothing to escalate to
+        # TerminateProcess; nothing to escalate to. This return is also what
+        # keeps _pid_gone's own nt guard unreached from here.
+        return True
     deadline = time.monotonic() + _STOP_WAIT
     while True:
         _reap(pid)
@@ -573,6 +749,8 @@ def stop_server() -> bool | None:
     _sock_path().unlink(missing_ok=True)
     _token_path().unlink(missing_ok=True)
     _params_file().unlink(missing_ok=True)
+    _last_use_path().unlink(missing_ok=True)
+    _watch_path().unlink(missing_ok=True)
     return stopped
 
 
@@ -1126,10 +1304,29 @@ def generate(prompt: str, cfg: dict, n: int = 1, force_oneshot: bool = False,
 
     t0 = time.time()
     if server_bin is not None:
+        # Lazy fallback: if the watchdog could not run (spawn failed, platform
+        # without flock), this still frees a server idle past the deadline on
+        # the next query.
+        idle_stop(cfg.get("idle_timeout", 0))
         port = start_server(model, server_bin, threads, quiet=quiet,
                             port=cfg.get("server_port"),
                             ctx_size=cfg.get("ctx_size", 2048))
-        raws = _query_server(port, user_msg, cfg, n, system=system, grammar=grammar)
+        it = _coerce_idle_timeout(cfg.get("idle_timeout", 0))
+        if it is None:
+            # Feature off: retract instructions so any live watchdog stands
+            # down instead of firing with a deadline from an earlier window.
+            _clear_watch_state()
+        else:
+            # Pre-query touch matters: an inference longer than the timeout
+            # must not look like idleness and get killed mid-flight.
+            touch_last_use(it)
+            _write_watch_file(it)
+            _spawn_watchdog()
+        with _heartbeat(it):
+            raws = _query_server(port, user_msg, cfg, n, system=system,
+                                 grammar=grammar)
+        if it is not None:
+            touch_last_use(it)
         mode = "server"
     else:
         cli = cfg_mod.find_llama_cli()

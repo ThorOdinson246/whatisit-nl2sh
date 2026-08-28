@@ -6,12 +6,14 @@ monkeypatched, and "model" paths are just empty tmp_path files that only need
 to exist.
 """
 import json
+import math
 import os
 import signal
 import socket
 import stat
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -1368,6 +1370,34 @@ class TestStopServerOwnership:
         assert time.time() - began < 0.5
         assert proc.wait(timeout=10) is not None
 
+    @pytest.mark.skipif(sys.platform == "win32",
+                        reason="no SIGKILL, and SIG_IGN for SIGTERM is not honoured")
+    def test_terminate_reaps_the_zombie_it_creates(
+            self, monkeypatch, tmp_path, request):
+        # A SIGKILLed child is a zombie until it is reaped, and a zombie still
+        # answers signal 0. Without the reap after SIGKILL, _terminate reports
+        # failure for a server it just killed and `stop` says none was running.
+        self._isolate(monkeypatch, tmp_path)
+        proc = subprocess.Popen(
+            [sys.executable, "-c",
+             "import signal, sys, time;"
+             " signal.signal(signal.SIGTERM, signal.SIG_IGN);"
+             " sys.stdout.write('x'); sys.stdout.flush(); time.sleep(60)"],
+            stdout=subprocess.PIPE)
+
+        def cleanup():
+            proc.kill()
+            proc.wait()
+            proc.stdout.close()
+
+        request.addfinalizer(cleanup)
+        assert proc.stdout.read(1) == b"x"
+        monkeypatch.setattr(engine, "_read_params",
+                            lambda: {"server_bin": self._recorded_bin(proc)})
+        monkeypatch.setattr(engine, "_STOP_WAIT", 0.3)
+        assert engine._terminate(proc.pid) is True
+        assert proc.wait(timeout=10) is not None
+
     def test_stop_server_kills_a_real_child_end_to_end(
             self, monkeypatch, tmp_path, request):
         sd = self._isolate(monkeypatch, tmp_path)
@@ -1404,3 +1434,334 @@ class TestStopServerOwnership:
         monkeypatch.setattr(engine.os, "kill",
                             lambda *a: pytest.fail("os.kill reached on Windows"))
         assert engine._pid_gone(4242) is False
+
+
+# ------------------------------------------------------------ idle timeout
+
+class TestIdleTimeout:
+    """--idle-timeout: the user-space watchdog unloads the resident
+    llama-server at N idle seconds. llama-server's own --sleep-idle-seconds
+    (the CVE-2026-43631 trigger) is never passed -- pinned by a launch-argv
+    guard below."""
+
+    def _isolate(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("WHATISIT_CONFIG_DIR", str(tmp_path / "cfg"))
+        monkeypatch.setenv("WHATISIT_DATA_DIR", str(tmp_path / "data"))
+        sd = tmp_path / "data" / "run"
+        sd.mkdir(parents=True)
+        return sd
+
+    def _seed_running(self, sd, *, timeout=300, age=400.0):
+        (sd / "server.pid").write_text("99999\n")
+        (sd / "server.watch").write_text(f"{timeout}\n")
+        if age is not None:
+            (sd / "server.last_use").write_text(f"{time.time() - age:.6f}\n")
+
+    @pytest.mark.parametrize("raw,want", [
+        (None, None), (0, None), (-3, None), ("tomorrow", None), ([], None),
+        (300, 300), ("300", 300),
+    ])
+    def test_coerce_idle_timeout(self, raw, want):
+        assert engine._coerce_idle_timeout(raw) == want
+
+    def test_touch_last_use_only_when_enabled(self, monkeypatch, tmp_path):
+        self._isolate(monkeypatch, tmp_path)
+        engine.touch_last_use(0)
+        engine.touch_last_use("tomorrow")
+        engine.touch_last_use(None)
+        assert not engine._last_use_path().exists()
+        engine.touch_last_use(300)
+        # nan would silently disarm every deadline; must never be written.
+        assert math.isfinite(float(engine._last_use_path().read_text()))
+    @pytest.mark.skipif(sys.platform == "win32", reason="chmod is a no-op on Windows")
+    def test_touch_writes_private_timestamp(self, monkeypatch, tmp_path):
+        self._isolate(monkeypatch, tmp_path)
+        engine.touch_last_use(300)
+        assert stat.S_IMODE(os.stat(engine._last_use_path()).st_mode) == 0o600
+
+    def test_idle_stop_disabled_is_a_noop(self, monkeypatch, tmp_path):
+        sd = self._isolate(monkeypatch, tmp_path)
+        self._seed_running(sd)
+        assert engine.idle_stop(0) is False
+        assert engine.idle_stop("garbage") is False
+        assert (sd / "server.pid").exists()
+
+    def test_idle_stop_fires_when_stale_and_running(self, monkeypatch, tmp_path):
+        sd = self._isolate(monkeypatch, tmp_path)
+        self._seed_running(sd, age=400.0, timeout=300)
+        killed = []
+        monkeypatch.setattr(engine, "_is_our_server", lambda pid: True)
+        monkeypatch.setattr(engine, "_pid_gone", lambda pid: True)
+        monkeypatch.setattr(engine.os, "kill",
+                            lambda pid, sig: killed.append((pid, sig)))
+        assert engine.idle_stop(300) is True
+        assert killed == [(99999, signal.SIGTERM)]
+        for name in ("server.pid", "server.watch", "server.last_use"):
+            assert not (sd / name).exists()
+
+    def test_idle_stop_returns_a_bool_when_the_server_is_left_alone(
+            self, monkeypatch, tmp_path):
+        # stop_server is tri-state now; idle_stop's own contract is not.
+        sd = self._isolate(monkeypatch, tmp_path)
+        self._seed_running(sd, age=400.0, timeout=300)
+        monkeypatch.setattr(engine, "stop_server", lambda: None)
+        assert engine.idle_stop(300) is False
+
+    @pytest.mark.parametrize("content", [
+        "fresh",                       # built at test time, inside the window
+        None,                          # missing file
+        "junk\n", "nan\n", "inf\n",    # corrupt / non-finite
+    ])
+    def test_idle_stop_ignores_fresh_missing_and_corrupt(
+            self, monkeypatch, tmp_path, content):
+        sd = self._isolate(monkeypatch, tmp_path)
+        killed = []
+        monkeypatch.setattr(engine, "_is_our_server", lambda pid: True)
+        monkeypatch.setattr(engine.os, "kill",
+                            lambda pid, sig: killed.append(sig))
+        self._seed_running(sd)
+        if content is None:
+            engine._last_use_path().unlink(missing_ok=True)
+        else:
+            stamp = f"{time.time() - 5:.6f}\n" if content == "fresh" else content
+            engine._last_use_path().write_text(stamp)
+        assert engine.idle_stop(300) is False
+        assert killed == []
+
+    def test_stop_server_clears_watchdog_state(self, monkeypatch, tmp_path):
+        sd = self._isolate(monkeypatch, tmp_path)
+        names = ("server.pid", "server.port", "server.sock", "server.token",
+                 "server.params", "server.last_use", "server.watch")
+        for name in names:
+            (sd / name).write_text("99999\n" if name == "server.pid" else "x\n")
+        monkeypatch.setattr(engine, "_is_our_server", lambda pid: True)
+        monkeypatch.setattr(engine, "_pid_gone", lambda pid: True)
+        monkeypatch.setattr(engine.os, "kill", lambda pid, sig: None)
+        assert engine.stop_server() is True
+        for name in names:
+            assert not (sd / name).exists(), name
+    def test_spawn_watchdog_runs_outside_the_caller_cwd(
+            self, monkeypatch, tmp_path):
+        # -m puts cwd first on sys.path, so a whatisit/ package in whatever
+        # directory the user happens to be in would be imported instead.
+        sd = self._isolate(monkeypatch, tmp_path)
+        seen = {}
+
+        def fake_popen(argv, **kw):
+            seen["argv"], seen["cwd"] = argv, kw.get("cwd")
+
+        monkeypatch.setattr(engine.subprocess, "Popen", fake_popen)
+        engine._spawn_watchdog()
+        assert seen["argv"][1:] == ["-m", "whatisit.watchdog"]
+        assert seen["cwd"] == str(sd)
+
+    def test_launch_cmd_never_carries_an_idle_or_sleep_flag(
+            self, monkeypatch, tmp_path):
+        # THE regression guard for CVE-2026-43631: whatever else changes,
+        # llama-server must never see --sleep-idle-seconds or any idle flag.
+        model = tmp_path / "model.gguf"
+        server = tmp_path / "llama-server"
+        model.write_bytes(b"model")
+        server.write_bytes(b"binary")
+        sd = self._isolate(monkeypatch, tmp_path)
+        # Socket transport: forcing TCP would demand /proc or lsof BEFORE
+        # readiness even starts, which does not exist on Windows CI.
+        monkeypatch.setattr(engine, "running_port", lambda: None)
+
+        captured = {}
+
+        class Process:
+            pid = 2468
+            returncode = None
+
+            @staticmethod
+            def poll():
+                return None
+
+        def fake_popen(cmd, **kwargs):
+            captured["cmd"] = list(cmd)
+            return Process()
+
+        monkeypatch.setattr(engine.subprocess, "Popen", fake_popen)
+        monkeypatch.setattr(engine, "_alive", lambda *a, **k: False)
+        with pytest.raises(RuntimeError, match="did not become ready"):
+            engine.start_server(model, server, threads=2, wait=0.05,
+                                quiet=True)
+
+        cmd = captured["cmd"]
+        assert "--sleep-idle-seconds" not in cmd
+        # Scope to flag-shaped args: the model/bin paths are caller-supplied
+        # tmp_path strings and may legitimately contain any substring.
+        flags = [a for a in cmd if isinstance(a, str) and a.startswith("-")]
+        assert not any("sleep" in f.lower() or "idle" in f.lower()
+                       for f in flags), cmd
+        # The launch itself stays untouched by the feature.
+        assert not (sd / "server.watch").exists()
+        assert not (sd / "server.last_use").exists()
+
+    def _generate_env(self, monkeypatch, tmp_path):
+        model = tmp_path / "model.gguf"
+        model.write_bytes(b"model")
+        sd = self._isolate(monkeypatch, tmp_path)
+        monkeypatch.setenv("WHATISIT_MODEL", str(model))
+        monkeypatch.setenv("WHATISIT_LLAMA_SERVER", str(model))  # exists == bin
+        return sd
+
+    def test_generate_wires_the_watchdog_in_order(self, monkeypatch, tmp_path):
+        sd = self._generate_env(monkeypatch, tmp_path)
+        order = []
+        real_touch = engine.touch_last_use
+
+        def spy_touch(v):
+            order.append("touch")
+            return real_touch(v)
+
+        def fake_start(*a, **k):
+            order.append("start")
+            return 8080
+
+        def spy_query(*a, **k):
+            order.append("query")
+            return [("echo hi", None)]
+
+        monkeypatch.setattr(engine.hostctx, "build",
+                            lambda p, enabled=True, include_volatile=True:
+                            ("SYS", p))
+        monkeypatch.setattr(engine.cfg_mod, "resolve_threads", lambda cfg: 2)
+        monkeypatch.setattr(engine, "idle_stop",
+                            lambda v: order.append("lazy") or False)
+        monkeypatch.setattr(engine, "start_server", fake_start)
+        monkeypatch.setattr(engine, "touch_last_use", spy_touch)
+        monkeypatch.setattr(engine, "_query_server", spy_query)
+        monkeypatch.setattr(engine, "_spawn_watchdog",
+                            lambda: order.append("spawn"))
+
+        cmds, _, mode = engine.generate("list files",
+                                        {"idle_timeout": 300,
+                                         "host_context": False})
+        assert mode == "server" and cmds == ["echo hi"]
+        # Lazy check first, start, pre-touch BEFORE the query (a long
+        # inference must not look idle), spawn, then post-touch on success.
+        assert order == ["lazy", "start", "touch", "spawn", "query", "touch"]
+        assert (sd / "server.watch").read_text() == "300\n"
+
+    def test_heartbeat_covers_an_inference_longer_than_the_deadline(
+            self, monkeypatch, tmp_path):
+        # CodeRabbit Major on this PR: pre/post touches alone let an
+        # inference OUTLIVING idle_timeout look idle -- a 45 s generation
+        # under --idle-timeout 30 would be killed at t=30. While the query
+        # blocks, the heartbeat must keep re-arming server.last_use.
+        self._generate_env(monkeypatch, tmp_path)
+        monkeypatch.setattr(engine.hostctx, "build",
+                            lambda p, enabled=True, include_volatile=True:
+                            ("SYS", p))
+        monkeypatch.setattr(engine.cfg_mod, "resolve_threads", lambda cfg: 2)
+        monkeypatch.setattr(engine, "idle_stop", lambda v: False)
+        monkeypatch.setattr(engine, "start_server", lambda *a, **k: 8080)
+        monkeypatch.setattr(engine, "_spawn_watchdog", lambda: None)
+
+        seen = {}
+
+        def slow_query(*a, **k):
+            first = float(engine._last_use_path().read_text())
+            # Block past one beat interval, watching for a refresh.
+            deadline = time.monotonic() + 2.0
+            while time.monotonic() < deadline:
+                if float(engine._last_use_path().read_text()) - first > 0.05:
+                    break
+                time.sleep(0.01)
+            seen["refreshed"] = \
+                float(engine._last_use_path().read_text()) - first > 0.05
+            return [("echo hi", None)]
+
+        monkeypatch.setattr(engine, "_query_server", slow_query)
+        cmds, _, mode = engine.generate("list files",
+                                        {"idle_timeout": 1,
+                                         "host_context": False})
+        assert mode == "server" and cmds == ["echo hi"]
+        assert seen["refreshed"] is True
+
+    def test_no_heartbeat_thread_when_disabled(self, monkeypatch, tmp_path):
+        self._generate_env(monkeypatch, tmp_path)
+        threads_before = threading.active_count()
+        monkeypatch.setattr(engine.hostctx, "build",
+                            lambda p, enabled=True, include_volatile=True:
+                            ("SYS", p))
+        monkeypatch.setattr(engine.cfg_mod, "resolve_threads", lambda cfg: 2)
+        monkeypatch.setattr(engine, "start_server", lambda *a, **k: 8080)
+        monkeypatch.setattr(engine, "_query_server",
+                            lambda *a, **k: [("echo hi", None)])
+        engine.generate("list files", {"idle_timeout": 0,
+                                       "host_context": False})
+        assert threading.active_count() == threads_before
+
+    def test_generate_disabled_retracts_a_live_watchdog(
+            self, monkeypatch, tmp_path):
+        sd = self._generate_env(monkeypatch, tmp_path)
+        # A previous --idle-timeout window left instructions behind.
+        (sd / "server.watch").write_text("300\n")
+        (sd / "server.last_use").write_text(f"{time.time():.6f}\n")
+        spawned = []
+        monkeypatch.setattr(engine.hostctx, "build",
+                            lambda p, enabled=True, include_volatile=True:
+                            ("SYS", p))
+        monkeypatch.setattr(engine.cfg_mod, "resolve_threads", lambda cfg: 2)
+        monkeypatch.setattr(engine, "start_server", lambda *a, **k: 8080)
+        monkeypatch.setattr(engine, "_query_server",
+                            lambda *a, **k: [("echo hi", None)])
+        monkeypatch.setattr(engine, "_spawn_watchdog",
+                            lambda: spawned.append(1))
+        engine.generate("list files", {"idle_timeout": 0,
+                                       "host_context": False})
+        assert spawned == []
+        assert not (sd / "server.watch").exists()
+        assert not (sd / "server.last_use").exists()
+
+    def test_generate_oneshot_never_touches_or_spawns(self, monkeypatch,
+                                                      tmp_path):
+        sd = self._generate_env(monkeypatch, tmp_path)
+        cli_bin = tmp_path / "llama-cli"
+        cli_bin.write_bytes(b"cli")
+        monkeypatch.delenv("WHATISIT_LLAMA_SERVER")
+        monkeypatch.setattr(engine.cfg_mod, "find_llama_cli",
+                            lambda: cli_bin)
+        monkeypatch.setattr(engine, "_query_oneshot",
+                            lambda *a, **k: [("echo hi", None)])
+        spawned = []
+        monkeypatch.setattr(engine, "_spawn_watchdog",
+                            lambda: spawned.append(1))
+        engine.generate("list files", {"idle_timeout": 300,
+                                       "host_context": False},
+                        force_oneshot=True)
+        assert spawned == []
+        assert not (sd / "server.watch").exists()
+        assert not (sd / "server.last_use").exists()
+
+    def test_spawn_failure_still_unloads_via_lazy_fallback(
+            self, monkeypatch, tmp_path):
+        # No fork available: the query must still succeed, and an already-
+        # stale server must still have been unloaded by the lazy check.
+        sd = self._generate_env(monkeypatch, tmp_path)
+        self._seed_running(sd, age=99999.0, timeout=300)
+        killed = []
+        monkeypatch.setattr(engine, "_is_our_server", lambda pid: True)
+        monkeypatch.setattr(engine, "_pid_gone", lambda pid: True)
+        monkeypatch.setattr(engine.os, "kill",
+                            lambda pid, sig: killed.append(sig))
+        monkeypatch.setattr(engine.hostctx, "build",
+                            lambda p, enabled=True, include_volatile=True:
+                            ("SYS", p))
+        monkeypatch.setattr(engine.cfg_mod, "resolve_threads", lambda cfg: 2)
+        monkeypatch.setattr(engine, "start_server", lambda *a, **k: 8080)
+        monkeypatch.setattr(engine, "_query_server",
+                            lambda *a, **k: [("echo hi", None)])
+
+        def no_fork(*a, **k):
+            raise OSError("cannot fork")
+
+        monkeypatch.setattr(engine.subprocess, "Popen", no_fork)
+        cmds, _, mode = engine.generate("list files",
+                                        {"idle_timeout": 300,
+                                         "host_context": False})
+        assert mode == "server" and cmds == ["echo hi"]
+        assert killed == [signal.SIGTERM]
