@@ -1147,16 +1147,27 @@ class TestStopServerOwnership:
         sd.mkdir(parents=True)
         return sd
 
+    @pytest.mark.parametrize("gone,record_kept,verdict",
+                             [(True, False, False), (False, True, None)])
     def test_stop_server_spares_a_process_that_is_not_ours(
-            self, monkeypatch, tmp_path):
+            self, monkeypatch, tmp_path, gone, record_kept, verdict):
+        # Never ours, so never signalled. But a pid that is still alive may be
+        # ours and merely unattributable, and wiping the record then strands a
+        # resident server nothing can find. A dead pid is just a stale record.
         sd = self._isolate(monkeypatch, tmp_path)
-        (sd / "server.pid").write_text("99999\n")
+        for name in ("server.pid", "server.port", "server.params"):
+            (sd / name).write_text("99999\n")
         killed = []
         monkeypatch.setattr(engine, "_is_our_server", lambda pid: False)
+        monkeypatch.setattr(engine, "_pid_gone", lambda pid: gone)
         monkeypatch.setattr(engine.os, "kill",
                             lambda pid, sig: killed.append(sig))
-        assert engine.stop_server() is False
+        # None, not False: a live pid we could not attribute is not the same
+        # answer as nothing to stop, and cmd_stop has to say so.
+        assert engine.stop_server() is verdict
         assert killed == []
+        assert (sd / "server.pid").exists() is record_kept
+        assert (sd / "server.params").exists() is record_kept
 
     @pytest.mark.skipif(sys.platform == "win32",
                         reason="no SIGKILL on Windows; _terminate returns before it")

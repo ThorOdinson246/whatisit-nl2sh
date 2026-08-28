@@ -545,7 +545,12 @@ def _terminate(pid: int) -> bool:
     return _pid_gone(pid)
 
 
-def stop_server() -> bool:
+def stop_server() -> bool | None:
+    """True stopped it, False nothing to stop, None left a live one alone.
+
+    None is the case where a process holds the recorded pid but cannot be
+    attributed to us, so signalling it would be a guess. The record is kept.
+    """
     pid_f = _state_dir() / "server.pid"
     stopped = False
     if pid_f.exists():
@@ -553,6 +558,14 @@ def stop_server() -> bool:
             pid = int(pid_f.read_text().strip())
             if _is_our_server(pid):
                 stopped = _terminate(pid)
+            elif not _pid_gone(pid):
+                # Alive but not attributable. Wiping the record here strands a
+                # resident server that nothing can find again. A stale record
+                # is the recoverable direction: start_server overwrites it.
+                # _pid_gone is unconditionally False on Windows, so there this
+                # branch also catches pids that are genuinely gone and no stop
+                # ever clears the record; the next start_server does.
+                return None
         except (ValueError, OSError):
             pass
         pid_f.unlink(missing_ok=True)

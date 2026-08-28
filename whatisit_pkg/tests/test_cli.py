@@ -225,6 +225,25 @@ class TestCmdQueryQuietDangerRefusal:
         assert rc != 7
         assert "disabled" not in capsys.readouterr().err
 
+# -------------------------------------------------------------------- stop
+
+class TestCmdStop:
+    @pytest.mark.parametrize("verdict,rc,needle,stream", [
+        (True,  0, "server stopped",    "out"),
+        (False, 0, "no server running", "out"),
+        (None,  1, "left it alone",     "err"),
+    ])
+    def test_reports_each_outcome(self, monkeypatch, capsys, verdict, rc,
+                                  needle, stream):
+        # None is the case the tri-state exists for: something is running on
+        # the recorded pid and we declined to touch it. Saying "no server
+        # running" there is the opposite of the truth.
+        monkeypatch.setattr(cli.engine, "stop_server", lambda: verdict)
+        assert cli.main(["stop"]) == rc
+        cap = capsys.readouterr()
+        assert needle in (cap.out if stream == "out" else cap.err)
+
+
 # ------------------------------------------------------------------ parser
 
 class TestBuildParser:
