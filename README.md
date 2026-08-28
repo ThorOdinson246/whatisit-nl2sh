@@ -203,6 +203,17 @@ shell context to.
 row I measured myself with the unmodified upstream scorer at temperature 0,
 `max_tokens=64`, embedding heuristic at threshold 0.75, icalfa 0.3.6.
 
+## Community Models
+
+While I keep iterating on the shipped model, here are community-trained alternatives
+worth trying — same base model family, different training recipes.
+
+| model | size | InterCode-ALFA (reported) |
+|---|---|---|
+| [nl2sh-qwen25-coder-1.5b](https://huggingface.co/barbarabhb/nl2sh-qwen25-coder-1.5b-GGUF) | 941 MB | 0.6567 |
+
+Thanks to lydorianP!
+
 ## Two sizes
 
 The default is the 1.5B. There's also a 3B, same recipe and same training data,
