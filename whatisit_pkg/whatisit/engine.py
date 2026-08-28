@@ -44,6 +44,7 @@ from .extract import extract
 HOST = "127.0.0.1"
 STOP = ["\n", "<|im_end|>", "```"]
 _OWNER_WAIT_MAX = 2.0
+_STOP_WAIT = 2.0        # seconds to let SIGTERM land before SIGKILL
 _TCP_INSPECTION_ERROR = (
     "TCP transport requires /proc or lsof to attribute the server connection; "
     "use the UNIX socket transport instead"
@@ -433,6 +434,37 @@ def running_port() -> int | None:
         return None
 
 
+def _is_windows() -> bool:
+    """Isolated so tests can fake Windows without rewriting global os.name.
+
+    Same reason as cli._is_windows: on Python 3.11 and older, os.name="nt"
+    makes pathlib hand back a WindowsPath, and instantiating one off Windows
+    raises NotImplementedError.
+    """
+    return os.name == "nt"
+
+
+def _pid_cmdline(pid: int) -> str | None:
+    """The command line of one already-known pid, or None if it is gone."""
+    try:
+        raw = Path(f"/proc/{pid}/cmdline").read_bytes()
+        return raw.replace(b"\x00", b" ").decode(errors="replace")
+    except OSError:
+        pass
+    # No /proc: macOS has ps, Windows tasklist. argv is passed without a shell.
+    cmd = (["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"]
+           if _is_windows() else ["ps", "-p", str(pid), "-o", "command="])
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=1.0)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if p.returncode != 0:
+        return None
+    # tasklist quotes every field and groups digits in the memory column; ps
+    # output must not be rewritten, a comma there is part of an argument.
+    return p.stdout.replace('"', " ").replace(",", " ") if _is_windows() else p.stdout
+
+
 def _is_our_server(pid: int) -> bool:
     """Confirm a pid really is our llama-server before signalling it.
 
@@ -440,33 +472,101 @@ def _is_our_server(pid: int) -> bool:
     pid. On a long-lived shared node that is somebody's -- possibly your own --
     unrelated process.
     """
+    cmdline = _pid_cmdline(pid)
+    if cmdline is None:
+        return False
+    binary = (_read_params() or {}).get("server_bin")
+    if not binary:
+        # Started before this version recorded params. Still require the name
+        # as a whole argument, so a log path cannot pass; tasklist reports the
+        # image name, hence the suffix.
+        return any(t.replace("\\", "/").rsplit("/", 1)[-1].removesuffix(".exe")
+                   == "llama-server" for t in cmdline.split())
+    # An exact argument, not a substring: `tail -f .../llama-server.log` names
+    # the path too. tasklist reports the image name only, hence the basename.
+    want = binary.replace("\\", "/").rsplit("/", 1)[-1] if _is_windows() else binary
+    return want in cmdline.split()
+
+
+def _pid_gone(pid: int) -> bool:
+    if _is_windows():
+        return False             # os.kill(pid, 0) TERMINATES on Windows
     try:
-        raw = Path(f"/proc/{pid}/cmdline").read_bytes()
-        cmdline = raw.replace(b"\x00", b" ").decode(errors="replace")
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return True
     except OSError:
-        # macOS has no /proc. ps is used only to inspect one already-known pid;
-        # argument vectors are still passed without a shell.
-        try:
-            p = subprocess.run(["ps", "-p", str(pid), "-o", "command="],
-                               capture_output=True, text=True, timeout=1.0)
-            if p.returncode != 0:
-                return False
-            cmdline = p.stdout
-        except (OSError, subprocess.TimeoutExpired):
-            return False
-    return "llama-server" in cmdline
+        return False             # EPERM: not ours to signal, but alive
+    return False
 
 
-def stop_server() -> bool:
+def _reap(pid: int) -> None:
+    """Clear the zombie if this server happens to be our own child.
+
+    A dead-but-unreaped process still answers signal 0, so without this the
+    escalation below would never see it exit.
+    """
+    try:
+        os.waitpid(pid, os.WNOHANG)
+    except (OSError, AttributeError, ValueError):
+        pass
+
+
+def _terminate(pid: int) -> bool:
+    """SIGTERM, then SIGKILL if it is still there.
+
+    stop_server drops the only record of this pid right after, so a server
+    that ignored SIGTERM would hold the model with nothing left to find it.
+    """
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except (ProcessLookupError, PermissionError):
+        return False
+    if _is_windows():
+        return True              # TerminateProcess; nothing to escalate to
+    deadline = time.monotonic() + _STOP_WAIT
+    while True:
+        _reap(pid)
+        if _pid_gone(pid):
+            return True
+        if time.monotonic() >= deadline:
+            break
+        time.sleep(0.05)
+    # The pid was last attributed up to _STOP_WAIT ago and SIGKILL cannot be
+    # caught, so confirm it is still ours before sending it.
+    if not _is_our_server(pid):
+        return False
+    try:
+        os.kill(pid, signal.SIGKILL)
+        time.sleep(0.05)
+    except OSError:
+        pass
+    _reap(pid)
+    return _pid_gone(pid)
+
+
+def stop_server() -> bool | None:
+    """True stopped it, False nothing to stop, None left a live one alone.
+
+    None is the case where a process holds the recorded pid but cannot be
+    attributed to us, so signalling it would be a guess. The record is kept.
+    """
     pid_f = _state_dir() / "server.pid"
     stopped = False
     if pid_f.exists():
         try:
             pid = int(pid_f.read_text().strip())
             if _is_our_server(pid):
-                os.kill(pid, signal.SIGTERM)
-                stopped = True
-        except (ProcessLookupError, ValueError, PermissionError):
+                stopped = _terminate(pid)
+            elif not _pid_gone(pid):
+                # Alive but not attributable. Wiping the record here strands a
+                # resident server that nothing can find again. A stale record
+                # is the recoverable direction: start_server overwrites it.
+                # _pid_gone is unconditionally False on Windows, so there this
+                # branch also catches pids that are genuinely gone and no stop
+                # ever clears the record; the next start_server does.
+                return None
+        except (ValueError, OSError):
             pass
         pid_f.unlink(missing_ok=True)
     _port_file().unlink(missing_ok=True)
@@ -561,6 +661,9 @@ def start_server(model: Path, server_bin: Path, threads: int,
         proc = subprocess.Popen(cmd, stdout=lf, stderr=lf, stdin=subprocess.DEVNULL,
                                 env=launch_env, start_new_session=True)
     _write_private(sd / "server.pid", str(proc.pid))
+    # Beside the pid, not after the readiness wait: a start that times out or
+    # dies still leaves a pid that stop_server has to be able to attribute.
+    _write_private(_params_file(), json.dumps(requested))
     if port:
         _write_private(_port_file(), str(port))
 
@@ -574,7 +677,6 @@ def start_server(model: Path, server_bin: Path, threads: int,
         if _alive(port or None, expected_pid=proc.pid if port else None):
             if not quiet:
                 print(" ready.", file=sys.stderr, flush=True)
-            _write_private(_params_file(), json.dumps(requested))
             return port
         time.sleep(0.3)
     raise RuntimeError(f"llama-server did not become ready in {wait:.0f}s; see {log}")

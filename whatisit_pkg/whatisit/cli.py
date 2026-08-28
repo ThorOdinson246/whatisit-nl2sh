@@ -672,7 +672,12 @@ def cmd_doctor(args, cfg: dict) -> int:
 
 
 def cmd_stop(args, cfg: dict) -> int:
-    print("whatisit: server stopped." if engine.stop_server() else "whatisit: no server running.")
+    stopped = engine.stop_server()
+    if stopped is None:
+        warn("whatisit: a server is running on the recorded pid but could not be "
+             "identified as ours; left it alone.")
+        return 1
+    out("whatisit: server stopped." if stopped else "whatisit: no server running.")
     return 0
 
 
