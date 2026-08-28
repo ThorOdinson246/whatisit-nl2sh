@@ -343,12 +343,15 @@ def _spawn_watchdog() -> None:
     """Spawn the detached singleton watchdog, best-effort."""
     try:
         kwargs = {}
-        if os.name == "nt":
+        if _is_windows():
             kwargs["creationflags"] = (subprocess.DETACHED_PROCESS
                                        | subprocess.CREATE_NEW_PROCESS_GROUP)
         else:
             kwargs["start_new_session"] = True
+        # cwd: -m puts it first on sys.path, so running from a directory
+        # holding a whatisit/ package would import that one instead.
         subprocess.Popen([sys.executable, "-m", "whatisit.watchdog"],
+                         cwd=str(_state_dir()),
                          stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                          stderr=subprocess.DEVNULL, close_fds=True, **kwargs)
     except OSError:
@@ -359,8 +362,9 @@ def idle_stop(idle_timeout) -> bool:
     """Stop a resident server that has been idle past its deadline.
 
     Fallback for when the watchdog cannot run (spawn failed, platform without
-    flock, etc.). The watchdog is the primary mechanism; this lazy check is
-    belt-and-suspenders and mirrors the watchdog's decision logic.
+    flock, etc.). Narrower than the watchdog on purpose: with no recorded
+    last_use there is nothing to age from here, so a launched-but-never-queried
+    server is left to the watchdog, which anchors on its own start instead.
     """
     timeout = _coerce_idle_timeout(idle_timeout)
     if timeout is None:
@@ -377,7 +381,7 @@ def idle_stop(idle_timeout) -> bool:
         return False
     if time.time() - last < timeout:
         return False
-    return stop_server()
+    return bool(stop_server())
 
 
 def _free_port() -> int:
@@ -669,10 +673,12 @@ def _pid_gone(pid: int) -> bool:
 
 
 def _reap(pid: int) -> None:
-    """Clear the zombie if this server happens to be our own child.
+    """Clear the zombie when the server is this process's own child.
 
-    A dead-but-unreaped process still answers signal 0, so without this the
-    escalation below would never see it exit.
+    Never true on the CLI paths, where stop_server runs in a fresh process or
+    in the watchdog: it applies to the in-process restart in start_server, and
+    to the tests. A dead-but-unreaped child still answers signal 0, so without
+    this the escalation below burns the whole window and still reports failure.
     """
     try:
         os.waitpid(pid, os.WNOHANG)
@@ -691,7 +697,9 @@ def _terminate(pid: int) -> bool:
     except (ProcessLookupError, PermissionError):
         return False
     if _is_windows():
-        return True              # TerminateProcess; nothing to escalate to
+        # TerminateProcess; nothing to escalate to. This return is also what
+        # keeps _pid_gone's own nt guard unreached from here.
+        return True
     deadline = time.monotonic() + _STOP_WAIT
     while True:
         _reap(pid)

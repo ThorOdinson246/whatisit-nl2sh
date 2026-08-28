@@ -2,11 +2,12 @@
 
 Spawned detached by engine.generate(); llama-server's native
 --sleep-idle-seconds flag is never used (in builds b7492-b9060 it triggers
-CVE-2026-43632). Unlike checking idleness only on the next query, this frees
+CVE-2026-43631). Unlike checking idleness only on the next query, this frees
 the model's RAM at N seconds even when no further query ever arrives.
 
 Contract with engine, all files inside the 0700 state dir:
-  server.pid     written by start_server(); disappearing or CHANGING ends us
+  server.pid     written by start_server(); re-read every tick, so a
+                 restart is followed, not treated as a stop
   server.watch   "<timeout>\\n", rewritten by every server-mode query while
                  the feature is on and removed when it is turned off
   server.last_use  touched before and after each server-mode query
@@ -24,6 +25,8 @@ import time
 from pathlib import Path
 
 _TICK_MAX = 5.0
+_RETRY = 1.0
+_GONE_TICKS = 3
 
 
 def _try_lock(path: Path):
@@ -100,33 +103,33 @@ def run(state_dir=None, now_fn=time.time, sleep_fn=time.sleep, stop_fn=None,
 def _loop(sd: Path, now_fn, sleep_fn, stop_fn, max_ticks) -> None:
     pid_f, watch_f, use_f = (sd / "server.pid", sd / "server.watch",
                              sd / "server.last_use")
-    pid = _read_int(pid_f)
-    if pid is None:
-        return
-    ticks = 0
+    started = now_fn()
+    ticks = gone = 0
     while max_ticks is None or ticks < max_ticks:
         ticks += 1
-        # Superseded (restart/model switch) or stopped: whatever watches now
-        # must attach to the CURRENT pid, not fire across generations.
-        if _read_int(pid_f) != pid:
-            return
-        timeout = _read_int(watch_f)
-        if timeout is None or timeout <= 0:
-            return                   # feature off, instructions retracted
-        last = _read_ts(use_f)
-        if last is None:             # launched, not yet queried: wait for it
-            sleep_fn(min(_TICK_MAX, max(0.05, timeout / 10)))
+        pid, timeout = _read_int(pid_f), _read_int(watch_f)
+        if pid is None or timeout is None or timeout <= 0:
+            # The sub-second gap where stop_server has unlinked the pid and
+            # start_server has not written the new one. We hold the lock, so a
+            # replacement spawn already gave up: wait rather than leave nothing
+            # watching. A full restart outlives this and is re-armed by the
+            # post-ready _spawn_watchdog().
+            gone += 1
+            if gone >= _GONE_TICKS:
+                return               # really stopped, or feature turned off
+            sleep_fn(_RETRY)
             continue
-        idle = max(0.0, now_fn() - last)
+        gone = 0
+        seen = _read_ts(use_f)
+        # Never queried: age from our own start, so a server that is launched
+        # and then abandoned still gets unloaded.
+        idle = max(0.0, now_fn() - (started if seen is None else seen))
         if idle < timeout:
             sleep_fn(min(timeout - idle, _TICK_MAX))
             continue
-        sleep_fn(0.2)                # grace: a query touching last_use now
-        last = _read_ts(use_f)       # also spawned a fresher watchdog
-        if last is not None and now_fn() - last < timeout:
-            return
-        if _read_int(pid_f) != pid:
-            return
+        sleep_fn(0.2)                # grace: a query may be touching now
+        if _read_ts(use_f) != seen or _read_int(pid_f) != pid:
+            continue                 # busy or superseded: keep watching
         if stop_fn is not None:
             stop_fn()
         else:

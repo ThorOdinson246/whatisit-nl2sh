@@ -1370,6 +1370,34 @@ class TestStopServerOwnership:
         assert time.time() - began < 0.5
         assert proc.wait(timeout=10) is not None
 
+    @pytest.mark.skipif(sys.platform == "win32",
+                        reason="no SIGKILL, and SIG_IGN for SIGTERM is not honoured")
+    def test_terminate_reaps_the_zombie_it_creates(
+            self, monkeypatch, tmp_path, request):
+        # A SIGKILLed child is a zombie until it is reaped, and a zombie still
+        # answers signal 0. Without the reap after SIGKILL, _terminate reports
+        # failure for a server it just killed and `stop` says none was running.
+        self._isolate(monkeypatch, tmp_path)
+        proc = subprocess.Popen(
+            [sys.executable, "-c",
+             "import signal, sys, time;"
+             " signal.signal(signal.SIGTERM, signal.SIG_IGN);"
+             " sys.stdout.write('x'); sys.stdout.flush(); time.sleep(60)"],
+            stdout=subprocess.PIPE)
+
+        def cleanup():
+            proc.kill()
+            proc.wait()
+            proc.stdout.close()
+
+        request.addfinalizer(cleanup)
+        assert proc.stdout.read(1) == b"x"
+        monkeypatch.setattr(engine, "_read_params",
+                            lambda: {"server_bin": self._recorded_bin(proc)})
+        monkeypatch.setattr(engine, "_STOP_WAIT", 0.3)
+        assert engine._terminate(proc.pid) is True
+        assert proc.wait(timeout=10) is not None
+
     def test_stop_server_kills_a_real_child_end_to_end(
             self, monkeypatch, tmp_path, request):
         sd = self._isolate(monkeypatch, tmp_path)
@@ -1408,12 +1436,12 @@ class TestStopServerOwnership:
         assert engine._pid_gone(4242) is False
 
 
-# --------------------------------------------------- idle watchdog (#42)
+# ------------------------------------------------------------ idle timeout
 
 class TestIdleTimeout:
     """--idle-timeout: the user-space watchdog unloads the resident
     llama-server at N idle seconds. llama-server's own --sleep-idle-seconds
-    (the CVE-2026-43632 trigger) is never passed -- pinned by a launch-argv
+    (the CVE-2026-43631 trigger) is never passed -- pinned by a launch-argv
     guard below."""
 
     def _isolate(self, monkeypatch, tmp_path):
@@ -1471,6 +1499,14 @@ class TestIdleTimeout:
         for name in ("server.pid", "server.watch", "server.last_use"):
             assert not (sd / name).exists()
 
+    def test_idle_stop_returns_a_bool_when_the_server_is_left_alone(
+            self, monkeypatch, tmp_path):
+        # stop_server is tri-state now; idle_stop's own contract is not.
+        sd = self._isolate(monkeypatch, tmp_path)
+        self._seed_running(sd, age=400.0, timeout=300)
+        monkeypatch.setattr(engine, "stop_server", lambda: None)
+        assert engine.idle_stop(300) is False
+
     @pytest.mark.parametrize("content", [
         "fresh",                       # built at test time, inside the window
         None,                          # missing file
@@ -1504,10 +1540,24 @@ class TestIdleTimeout:
         assert engine.stop_server() is True
         for name in names:
             assert not (sd / name).exists(), name
+    def test_spawn_watchdog_runs_outside_the_caller_cwd(
+            self, monkeypatch, tmp_path):
+        # -m puts cwd first on sys.path, so a whatisit/ package in whatever
+        # directory the user happens to be in would be imported instead.
+        sd = self._isolate(monkeypatch, tmp_path)
+        seen = {}
+
+        def fake_popen(argv, **kw):
+            seen["argv"], seen["cwd"] = argv, kw.get("cwd")
+
+        monkeypatch.setattr(engine.subprocess, "Popen", fake_popen)
+        engine._spawn_watchdog()
+        assert seen["argv"][1:] == ["-m", "whatisit.watchdog"]
+        assert seen["cwd"] == str(sd)
 
     def test_launch_cmd_never_carries_an_idle_or_sleep_flag(
             self, monkeypatch, tmp_path):
-        # THE regression guard for CVE-2026-43632: whatever else changes,
+        # THE regression guard for CVE-2026-43631: whatever else changes,
         # llama-server must never see --sleep-idle-seconds or any idle flag.
         model = tmp_path / "model.gguf"
         server = tmp_path / "llama-server"

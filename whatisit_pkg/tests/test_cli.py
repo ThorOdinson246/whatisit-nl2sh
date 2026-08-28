@@ -497,14 +497,12 @@ class TestQueryFlagsApply:
         assert "list files" in err
 
 
-
-
 # ------------------------------------------------------- --idle-timeout (#42)
 
 class TestIdleTimeoutFlag:
     """Per-invocation idle-unload deadline, following the --port/--threads
     value-flag pattern. The feature is the user-space watchdog; llama-server's
-    own --sleep-idle-seconds (the CVE-2026-43632 trigger) never appears."""
+    own --sleep-idle-seconds (the CVE-2026-43631 trigger) never appears."""
 
     def _isolate(self, monkeypatch, tmp_path):
         monkeypatch.setenv("WHATISIT_CONFIG_DIR", str(tmp_path / "cfg"))
