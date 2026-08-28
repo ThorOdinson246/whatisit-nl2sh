@@ -963,6 +963,28 @@ def generate(prompt: str, cfg: dict, n: int = 1, force_oneshot: bool = False,
     mode is one of "remote", "server", or "oneshot". Remote mode is selected by
     a configured OpenAI-compatible base URL and needs no local model at all.
     """
+    # Distro guidance (opt-in) and host context both need the host package
+    # manager: guidance uses it for the GBNF grammar and the rewrite backstop,
+    # host context for the full facts block. The grammar is gated on BOTH
+    # install-intent and use_grammar (--no-grammar turns only the constraint
+    # off), so a GBNF that rejects a valid command form must not disable the
+    # rewrite path, and a non-install query is never grammar-constrained at
+    # all. Crucially, the grammar and the rewrite do NOT require host_context:
+    # the facts block is measured harmful on the shipped model, but grammar +
+    # regex cost no tokens and fix a real failure class on their own.
+    guidance_on = bool(cfg.get("distro_guidance", False))
+    context_on = bool(cfg.get("host_context", True))
+    host_pkg = "unknown"
+    if guidance_on or context_on:
+        try:
+            host_pkg = hostctx.stable_facts().get("pkg", "unknown")
+        except (OSError, UnicodeDecodeError):
+            pass
+    grammar = None
+    if (guidance_on and cfg.get("use_grammar", True) and host_pkg != "unknown"
+            and hostctx.is_install_request(prompt)):
+        grammar = hostctx.grammar_for_pkg(host_pkg)
+
     remote = cfg_mod.remote_config(cfg)
     if remote is not None:
         if not remote["model"]:
@@ -976,11 +998,14 @@ def generate(prompt: str, cfg: dict, n: int = 1, force_oneshot: bool = False,
         # cwd, which the user did not type, so it is withheld from the two
         # flows whose output can run. Ordinary suggestions still get it.
         system, user_msg = hostctx.build(
-            prompt, enabled=cfg.get("host_context", True),
-            include_volatile=not (for_execution or quiet))
+            prompt, enabled=context_on,
+            include_volatile=not (for_execution or quiet), pkg_line=guidance_on)
         t0 = time.time()
+        # No `grammar` wire field here: llama-server accepts it, but generic
+        # OpenAI-compatible endpoints may reject unknown fields outright. The
+        # postprocess rewrite below remains the backstop on this path.
         raws = _query_remote(remote, user_msg, cfg, n, system=system)
-        return _collect_commands(raws), time.time() - t0, "remote"
+        return _collect_commands(raws, host_pkg), time.time() - t0, "remote"
 
     model = cfg_mod.find_model()
     if model is None:
@@ -997,30 +1022,13 @@ def generate(prompt: str, cfg: dict, n: int = 1, force_oneshot: bool = False,
         elif (c := Path(cfg.get("llama_server", "/nonexistent"))).exists():
             server_bin = c
 
-    # Host context defaults ON: it is prefix-cached, so it costs one-time
-    # prefill rather than per-query latency, and it removed a whole class of
-    # placeholder / wrong-tool failures. cfg["host_context"]=false disables it.
+    # Host context defaults ON when the key is absent (DEFAULTS sets it False);
+    # it is prefix-cached, so it costs one-time prefill rather than per-query
+    # latency. cfg["host_context"]=false disables it. distro_guidance folds in
+    # only the one-line package-manager sentence instead of the full block.
     system, user_msg = hostctx.build(
-        prompt, enabled=cfg.get("host_context", True),
-        include_volatile=not (for_execution or quiet))
-
-    # GBNF grammar + distro-aware postprocessing: constrain install verbs to the
-    # host's package manager and rewrite any wrong-distro syntax as a backstop.
-    # Host-package detection runs whenever host context is on -- it feeds the
-    # postprocess backstop. The grammar is gated on BOTH install-intent and
-    # use_grammar (--no-grammar turns only the constraint off), so a GBNF that
-    # turns out to reject a valid command form must not disable the rewrite
-    # path, and a non-install query is never grammar-constrained at all.
-    host_pkg = "unknown"
-    grammar = None
-    if cfg.get("host_context", True):
-        try:
-            host_pkg = hostctx.stable_facts().get("pkg", "unknown")
-        except (OSError, UnicodeDecodeError):
-            pass
-        if (cfg.get("use_grammar", True) and host_pkg != "unknown"
-                and hostctx.is_install_request(prompt)):
-            grammar = hostctx.grammar_for_pkg(host_pkg)
+        prompt, enabled=context_on,
+        include_volatile=not (for_execution or quiet), pkg_line=guidance_on)
 
     t0 = time.time()
     if server_bin is not None:

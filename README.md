@@ -107,10 +107,29 @@ whatisit list files changed in the last week
 | `-n N` | show N alternative commands instead of one |
 | `-q`, `--quiet` | print only the bare command, for `$(...)` substitution |
 | `-t`, `--timing` | report how long generation took |
+| `--distro-guidance` / `--no-distro-guidance` | constrain install commands to this distro's package manager, for this invocation |
 
 Nothing runs unless you pass `-e` and confirm at the prompt. Anything flagged
 `DANGER` is never auto-run at all. See [Safety](#safety) for what gets flagged
 and what the checker can't see.
+
+### Wrong package manager?
+
+If the model suggests `apt install` on Arch or `pacman -S` on Debian, turn on
+distro guidance:
+
+```bash
+whatisit config --set distro_guidance=true
+```
+
+This is opt-in because the full host-context prompt block measured slightly
+worse on the benchmark for the bundled 1.5B model. Guidance costs one short
+prefix-cached sentence: on the local backends, install requests are constrained
+by a grammar to your package manager (`pacman -S`, `apt install`,
+`dnf install`, ...), and any foreign syntax that still slips through is
+rewritten to yours afterwards. Remote endpoints skip the grammar (not all of
+them accept the field) but keep the rewrite.
+Per-invocation: `whatisit --distro-guidance install docker`.
 
 ```bash
 # use the result inline

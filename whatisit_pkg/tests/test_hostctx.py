@@ -694,6 +694,13 @@ class TestGrammar:
         self._assert_accepts("pacman", "pacman -S libc++1")
         self._assert_accepts("brew", "brew install python3.11")
 
+    def test_dnf_pkg_names_with_digits(self):
+        """Regression: the dnf grammar's char class read [a-zA-Z0_9_.+-]
+        (`0_`, not `0-9`) -- it happened to accept letters by accident but was
+        not the intended class."""
+        self._assert_accepts("dnf", "dnf install python3.11")
+        self._assert_accepts("dnf", "sudo dnf install libxml2")
+
     def test_unknown_pkg_returns_none(self):
         assert hostctx.grammar_for_pkg("nonexistent") is None
 
@@ -820,3 +827,115 @@ class TestPostprocess:
     def test_multi_package_install(self):
         got = hostctx.postprocess_command("apt-get install htop nmon", "pacman")
         assert got == "pacman -S htop nmon"
+
+
+# ---------------------------------------------------------------------------
+# pkg_guidance_line() + build(pkg_line=...)
+# ---------------------------------------------------------------------------
+
+class TestPkgGuidanceLine:
+    def _facts(self, pkg):
+        return {"pkg": pkg, "distro": "Arch Linux", "distro_version": "",
+                "arch": "x86_64", "shell": "zsh", "present": [], "missing": []}
+
+    def test_exact_constraint_text_for_pacman(self):
+        """The line joins the cached system prompt: pin its full wording so an
+        accidental edit cannot silently change what every host sends."""
+        expected = ("<constraint>\n"
+                    "This machine manages packages exclusively with pacman; "
+                    "install, update, and remove software only with pacman.\n"
+                    "</constraint>")
+        assert hostctx.pkg_guidance_line(self._facts("pacman")) == expected
+
+    def test_unknown_pkg_returns_empty(self):
+        assert hostctx.pkg_guidance_line(self._facts("unknown")) == ""
+
+    def test_does_not_name_foreign_managers(self):
+        """stable_block()'s note: naming a banned tool primes a small model
+        toward it. The guidance line must mention only the host's manager."""
+        line = hostctx.pkg_guidance_line(self._facts("pacman"))
+        for foreign in ("apt", "dnf", "yum", "zypper", "apk", "brew"):
+            assert foreign not in line
+
+    def test_front_loads_the_manager_name(self):
+        """The shipped 1.5B model weighs early tokens heavily: the manager
+        name must appear in the first sentence half, not the tail."""
+        line = hostctx.pkg_guidance_line(self._facts("dnf"))
+        first_half = line[:len(line) // 2]
+        assert "dnf" in first_half
+
+    def test_byte_stable_across_calls(self, monkeypatch, tmp_path):
+        """The line joins the prefix-cached system prompt; it must be
+        deterministic so the cache stays valid."""
+        monkeypatch.setenv("WHATISIT_DATA_DIR", str(tmp_path / "data"))
+        facts = self._facts("apt")
+        assert hostctx.pkg_guidance_line(facts) == hostctx.pkg_guidance_line(facts)
+
+    def test_uses_real_facts_when_none_given(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("WHATISIT_DATA_DIR", str(tmp_path / "data"))
+        monkeypatch.setattr(hostctx, "_distro_info",
+                            lambda: {"id": "arch", "name": "Arch Linux",
+                                     "version": "", "version_id": "",
+                                     "id_like": []})
+        monkeypatch.setattr(hostctx.shutil, "which",
+                            lambda x: x == "pacman")
+        monkeypatch.setattr(hostctx.platform, "system", lambda: "Linux")
+        line = hostctx.pkg_guidance_line()
+        assert "pacman" in line
+
+
+class TestBuildPkgLine:
+    """build(pkg_line=True) folds in only the one-line guidance -- the opt-in
+    distro_guidance mode that keeps the measured-harmful facts block off."""
+
+    def _probe_pacman(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("WHATISIT_DATA_DIR", str(tmp_path / "data"))
+        monkeypatch.setattr(hostctx, "_distro_info",
+                            lambda: {"id": "arch", "name": "Arch Linux",
+                                     "version": "", "version_id": "",
+                                     "id_like": []})
+        monkeypatch.setattr(hostctx.shutil, "which", lambda x: x == "pacman")
+        monkeypatch.setattr(hostctx.platform, "system", lambda: "Linux")
+
+    def test_pkg_line_appended_without_facts_block(self, monkeypatch, tmp_path):
+        self._probe_pacman(monkeypatch, tmp_path)
+        system, user = hostctx.build("install numpy", enabled=False,
+                                     include_volatile=False, pkg_line=True)
+        assert "<host_environment>" not in system
+        assert "<constraint>" in system
+        assert "pacman" in system
+        assert user == "install numpy"
+
+    def test_pkg_line_keeps_volatile_out_of_the_system_prompt(self, monkeypatch, tmp_path):
+        """The guidance line joins the cached prefix; volatile facts must stay
+        on the user side exactly as with the full facts block."""
+        self._probe_pacman(monkeypatch, tmp_path)
+        monkeypatch.chdir(tmp_path)
+        system, user = hostctx.build("list files", enabled=False, pkg_line=True)
+        assert "Working directory" not in system
+        assert "Working directory" in user
+
+    def test_no_line_when_pkg_unknown(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("WHATISIT_DATA_DIR", str(tmp_path / "data"))
+        monkeypatch.setattr(hostctx, "_distro_info",
+                            lambda: {"id": "nixos", "name": "NixOS",
+                                     "version": "", "version_id": "",
+                                     "id_like": []})
+        monkeypatch.setattr(hostctx.shutil, "which", lambda x: False)
+        monkeypatch.setattr(hostctx.platform, "system", lambda: "Linux")
+        system, user = hostctx.build("install numpy", enabled=False,
+                                     include_volatile=False, pkg_line=True)
+        assert system == cfg_mod.SYSTEM_PROMPT
+        assert user == "install numpy"
+
+    def test_full_block_subsumes_the_line(self, monkeypatch, tmp_path):
+        self._probe_pacman(monkeypatch, tmp_path)
+        system, _ = hostctx.build("install numpy", enabled=True, pkg_line=True)
+        assert "<host_environment>" in system
+        # exactly one constraint mentioning pacman comes from stable_block()
+        assert system.count("This machine manages packages") == 0
+
+    def test_disabled_and_no_pkg_line_is_plain(self):
+        system, user = hostctx.build("install numpy", enabled=False, pkg_line=False)
+        assert system == cfg_mod.SYSTEM_PROMPT
+        assert user == "install numpy"

@@ -595,7 +595,7 @@ class TestGenerateDiscardsTruncatedCandidates:
 
         class CaptureHostCtx:
             @staticmethod
-            def build(prompt, enabled=True, cwd=None, include_volatile=True):
+            def build(prompt, enabled=True, cwd=None, include_volatile=True, pkg_line=False):
                 captured["include_volatile"] = include_volatile
                 return ("SYSTEM PROMPT", prompt)
 
@@ -720,7 +720,7 @@ class TestServerOverridesReachTheBoundary:
 
 class _FakeHostCtx:
     @staticmethod
-    def build(prompt, enabled=True, cwd=None, include_volatile=True):
+    def build(prompt, enabled=True, cwd=None, include_volatile=True, pkg_line=False):
         return ("SYSTEM PROMPT", prompt)
     @staticmethod
     def stable_facts():
@@ -957,7 +957,8 @@ class TestGenerateRemote:
     def _enable_remote(self, monkeypatch, remote):
         monkeypatch.setattr(cfg_mod, "remote_config", lambda cfg: remote)
         monkeypatch.setattr(engine.hostctx, "build",
-                            lambda p, enabled=True, cwd=None, include_volatile=True: ("SYS", p))
+                            lambda p, enabled=True, cwd=None, include_volatile=True,
+                            pkg_line=False: ("SYS", p))
 
     @pytest.mark.parametrize("kwargs", [{"quiet": True}, {"for_execution": True}])
     def test_remote_execution_paths_suppress_volatile_host_context(
@@ -966,7 +967,8 @@ class TestGenerateRemote:
         monkeypatch.setattr(cfg_mod, "remote_config", lambda cfg: remote)
         captured = {}
 
-        def capture_context(prompt, enabled=True, cwd=None, include_volatile=True):
+        def capture_context(prompt, enabled=True, cwd=None, include_volatile=True,
+                            pkg_line=False):
             captured["include_volatile"] = include_volatile
             return ("SYS", prompt)
 
@@ -1057,7 +1059,8 @@ class TestGenerateGrammarAndPostprocess:
 
         class FakeHost:
             @staticmethod
-            def build(prompt, enabled=True, cwd=None, include_volatile=True):
+            def build(prompt, enabled=True, cwd=None, include_volatile=True,
+                      pkg_line=False):
                 return ("SYS", prompt)
             @staticmethod
             def stable_facts():
@@ -1080,22 +1083,101 @@ class TestGenerateGrammarAndPostprocess:
             return [("pacman -S htop", "stop")]
         monkeypatch.setattr(engine, "_query_server", fake_query_server)
 
-        cmds, _, mode = engine.generate("install htop", {}, n=1)
+        cmds, _, mode = engine.generate("install htop", {"distro_guidance": True}, n=1)
         assert captured["grammar"] == "fake-grammar"
         assert mode == "server"
+
+    def test_no_grammar_by_default(self, monkeypatch, tmp_path):
+        """distro_guidance is opt-in: with defaults (and host_context off) no
+        GBNF is sent and no rewrite runs."""
+        self._fake_cfg_and_model(monkeypatch, tmp_path)
+
+        class FakeHost:
+            @staticmethod
+            def build(prompt, enabled=True, cwd=None, include_volatile=True,
+                      pkg_line=False):
+                captured["pkg_line"] = pkg_line
+                return ("SYS", prompt)
+            @staticmethod
+            def stable_facts():
+                raise AssertionError("stable_facts must not run with all guidance off")
+            @staticmethod
+            def grammar_for_pkg(pkg_mgr):
+                return "fake-grammar"
+            @staticmethod
+            def is_install_request(prompt):
+                return True
+            @staticmethod
+            def postprocess_command(cmd, pkg_mgr):
+                raise AssertionError("postprocess must not run with all guidance off")
+
+        monkeypatch.setattr(engine, "hostctx", FakeHost())
+        captured = {}
+        def fake_query_server(port, prompt, cfg, n, system=None, grammar=None):
+            captured["grammar"] = grammar
+            return [("apt install htop", "stop")]
+        monkeypatch.setattr(engine, "_query_server", fake_query_server)
+
+        cmds, _, _ = engine.generate("install htop",
+                                     {"host_context": False}, n=1)
+        assert captured["grammar"] is None
+        assert cmds == ["apt install htop"]
+
+    def test_grammar_without_host_context(self, monkeypatch, tmp_path):
+        """The regression behind issue #31: distro guidance must work on its
+        own -- host_context stays off (its measured harm), yet install prompts
+        are still constrained to the host package manager and rewritten."""
+        self._fake_cfg_and_model(monkeypatch, tmp_path)
+
+        class FakeHost:
+            @staticmethod
+            def build(prompt, enabled=True, cwd=None, include_volatile=True,
+                      pkg_line=False):
+                captured["enabled"] = enabled
+                captured["pkg_line"] = pkg_line
+                return ("SYS", prompt)
+            @staticmethod
+            def stable_facts():
+                return {"pkg": "pacman"}
+            @staticmethod
+            def grammar_for_pkg(pkg_mgr):
+                return "fake-grammar"
+            @staticmethod
+            def is_install_request(prompt):
+                return "install" in prompt
+            @staticmethod
+            def postprocess_command(cmd, pkg_mgr):
+                return cmd.replace("apt-get install -y", "pacman -S")
+
+        monkeypatch.setattr(engine, "hostctx", FakeHost())
+        captured = {}
+        def fake_query_server(port, prompt, cfg, n, system=None, grammar=None):
+            captured["grammar"] = grammar
+            return [("apt-get install -y htop", "stop")]
+        monkeypatch.setattr(engine, "_query_server", fake_query_server)
+
+        cfg = {"distro_guidance": True, "host_context": False}
+        cmds, _, _ = engine.generate("install htop", cfg, n=1)
+        assert captured["grammar"] == "fake-grammar"
+        assert captured["enabled"] is False      # full facts block stayed off
+        assert captured["pkg_line"] is True      # one-line guidance went instead
+        assert cmds == ["pacman -S htop"]
 
     def test_postprocesses_wrong_distro_syntax(self, monkeypatch, tmp_path):
         self._fake_cfg_and_model(monkeypatch, tmp_path)
         # Drive postprocessing with the real implementation, pinned to pacman.
-        monkeypatch.setattr(engine.hostctx, "build",
-                            lambda p, enabled=True, cwd=None, include_volatile=True: ("SYS", p))
+        monkeypatch.setattr(
+            engine.hostctx, "build",
+            lambda p, enabled=True, cwd=None, include_volatile=True,
+            pkg_line=False: ("SYS", p))
         monkeypatch.setattr(engine.hostctx, "stable_facts",
                             lambda *a, **k: {"pkg": "pacman"})
         monkeypatch.setattr(engine.hostctx, "grammar_for_pkg",
                             lambda pkg_mgr: None)
         monkeypatch.setattr(engine, "_query_server",
                             lambda *a, **k: [("apt-get install -y htop", "stop")])
-        cmds, _, _ = engine.generate("install htop", {}, n=1)
+        cfg = {"distro_guidance": True, "host_context": False}
+        cmds, _, _ = engine.generate("install htop", cfg, n=1)
         assert cmds == ["pacman -S htop"]
 
     def test_oneshot_passes_prompts_and_grammar_via_files(self, monkeypatch, tmp_path):

@@ -161,20 +161,28 @@ def cmd_query(args, cfg: dict) -> int:
         cfg["host_context"] = args.host_context
     if args.grammar is not None:
         cfg["use_grammar"] = args.grammar
+    if args.distro_guidance is not None:
+        cfg["distro_guidance"] = args.distro_guidance
     if args.debug:
         # Show the exact prompt sent to the model and the active GBNF grammar
         # (if any). Intended for diagnosing why the 1.5B model misbehaves; goes
-        # to stderr so `-q` output is unaffected.
-        system, user_msg = engine.hostctx.build(prompt,
-                                                enabled=cfg.get("host_context", True))
+        # to stderr so `-q` output is unaffected. Mirrors generate()'s gating:
+        # the grammar needs distro_guidance, use_grammar, and an install-intent
+        # prompt -- host_context alone does not send one.
+        guidance_on = cfg.get("distro_guidance", False)
+        context_on = cfg.get("host_context", True)
+        system, user_msg = engine.hostctx.build(
+            prompt, enabled=context_on,
+            include_volatile=not (args.quiet or args.execute),
+            pkg_line=guidance_on)
         pkg = "unknown"
         grammar = None
-        if cfg.get("host_context", True) and cfg.get("use_grammar", True):
+        if guidance_on and cfg.get("use_grammar", True):
             try:
                 pkg = engine.hostctx.stable_facts().get("pkg", "unknown")
             except OSError:
                 pass
-            if pkg != "unknown" and hasattr(engine.hostctx, "grammar_for_pkg"):
+            if pkg != "unknown" and engine.hostctx.is_install_request(prompt):
                 grammar = engine.hostctx.grammar_for_pkg(pkg)
         _emit_debug(prompt, system, user_msg, grammar)
 
@@ -744,6 +752,11 @@ def build_parser() -> argparse.ArgumentParser:
                     help="enable the GBNF grammar for this invocation")
     ap.add_argument("--no-grammar", dest="grammar", action="store_false",
                     help="disable the GBNF grammar for this invocation")
+    ap.add_argument("--distro-guidance", dest="distro_guidance", action="store_true",
+                    help="constrain install commands to this distro's package "
+                         "manager for this invocation")
+    ap.add_argument("--no-distro-guidance", dest="distro_guidance", action="store_false",
+                    help="disable distro guidance for this invocation")
     ap.add_argument("--debug", action="store_true",
                     help="print the exact prompt and grammar sent to the model")
 
@@ -777,7 +790,9 @@ def build_parser() -> argparse.ArgumentParser:
 SUBCOMMANDS = {"setup", "doctor", "stop", "config"}
 _FLAGS_NOARG = {"-e", "--execute", "-q", "--quiet", "-t", "--timing", "--oneshot",
                 "--host-context", "--no-host-context",
-                "--grammar", "--no-grammar", "--debug", "-y", "--yes"}
+                "--grammar", "--no-grammar",
+                "--distro-guidance", "--no-distro-guidance",
+                "--debug", "-y", "--yes"}
 _FLAGS_ARG = {"-n", "--num"}
 _FLAGS_QUERY_ARG = {"--port", "--threads", "--ctx-size", "--model"}
 
@@ -801,6 +816,7 @@ class QueryArgs:
         self.timing, self.oneshot = False, False
         self.port, self.threads, self.ctx_size, self.model = None, None, None, None
         self.host_context, self.grammar, self.debug, self.yes = None, None, False, False
+        self.distro_guidance = None
         i = 0
         while i < len(argv):
             a = argv[i]
@@ -816,6 +832,10 @@ class QueryArgs:
                     self.grammar = True
                 elif a == "--no-grammar":
                     self.grammar = False
+                elif a == "--distro-guidance":
+                    self.distro_guidance = True
+                elif a == "--no-distro-guidance":
+                    self.distro_guidance = False
                 elif a in ("-y", "--yes"):
                     self.yes = True
                 else:

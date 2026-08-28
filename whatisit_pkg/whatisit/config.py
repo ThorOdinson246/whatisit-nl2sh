@@ -99,6 +99,16 @@ DEFAULTS = {
     # OFF by default. It is cheap (prefix-cached) but MEASURED HARMFUL on the
     # only benchmark available: 54.2% -> 45.1% pass, p=0.0004. See hostctx.py.
     "host_context": False,
+    # OFF by default (opt-in). Keeps the full host-facts prompt block out of the
+    # way of the shipped model's measured regression, while still fixing the
+    # wrong-distro failure: when on, install prompts are GBNF-constrained to
+    # the host package manager on the local backends (llama-server /
+    # llama-cli), and every candidate command is regex-rewritten from foreign
+    # syntax as a backstop everywhere -- remote endpoints included, though they
+    # get no grammar field on the wire. Costs one short prefix-cached line.
+    # Enable if whatisit suggests `apt install` on Arch, `pacman -S` on Debian,
+    # etc.
+    "distro_guidance": False,
     # GBNF grammar constraint for install prompts. When on (default) and the
     # host's package manager is known, the model is constrained to that manager's
     # install syntax. --no-grammar disables only the constraint; distro-aware

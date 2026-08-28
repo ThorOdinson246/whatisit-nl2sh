@@ -448,7 +448,8 @@ class TestQueryFlagsApply:
         monkeypatch.setattr(cli.engine, "generate",
                             lambda *a, **k: (["ls"], 0.01, "server"))
         monkeypatch.setattr(cli.engine.hostctx, "build",
-                            lambda p, enabled=True, cwd=None: ("SYS", p))
+                            lambda p, enabled=True, cwd=None, include_volatile=True,
+                            pkg_line=False: ("SYS", p))
         rc = cli.main(["--debug", "list", "files"])
         assert rc == 0
         err = capsys.readouterr().err
@@ -457,22 +458,22 @@ class TestQueryFlagsApply:
 
     def test_debug_shows_grammar_when_available(self, monkeypatch, tmp_path, capsys):
         self._isolate(monkeypatch, tmp_path)
-        cli.main(["config", "--set", "host_context=true"])
+        # distro_guidance is the grammar gate; an install-intent prompt is
+        # required for the debug view to show a grammar, mirroring generate().
+        cli.main(["config", "--set", "distro_guidance=true"])
         capsys.readouterr()
         monkeypatch.setattr(cli.engine, "generate",
                             lambda *a, **k: (["ls"], 0.01, "server"))
         monkeypatch.setattr(cli.engine.hostctx, "build",
-                            lambda p, enabled=True, cwd=None: ("SYS", p))
+                            lambda p, enabled=True, cwd=None, include_volatile=True,
+                            pkg_line=False: ("SYS", p))
         monkeypatch.setattr(cli.engine.hostctx, "stable_facts",
                             lambda *a, **k: {"pkg": "pacman"})
-        # grammar_for_pkg may not exist (PR A vs PR B); if so, create a stub
-        # so the debug path can derive a grammar through the hasattr guard.
-        # raising=False restores the original after the test either way.
-        monkeypatch.setattr(cli.engine.hostctx, "grammar_for_pkg",
-                            lambda pkg: "grammar-blob", raising=False)
-        rc = cli.main(["--debug", "list", "files"])
+        # The REAL pacman grammar must appear in the debug output -- a stub
+        # would pass even if gating picked up the wrong manager or none.
+        rc = cli.main(["--debug", "install", "docker"])
         assert rc == 0
         err = capsys.readouterr().err
         assert "--debug" in err
-        assert "grammar-blob" in err
-        assert "list files" in err
+        assert 'install      ::= "pacman -S "' in err
+        assert "install docker" in err

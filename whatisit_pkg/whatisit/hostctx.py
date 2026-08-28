@@ -467,7 +467,7 @@ root         ::= command ("\n" command)* "\n"?
 command      ::= sudo-install | install
 sudo-install ::= "sudo " install
 install      ::= "dnf install " pkg-name (" " pkg-name)*
-pkg-name     ::= [a-zA-Z0_9_.+-]+
+pkg-name     ::= [a-zA-Z0-9_.+-]+
 ''',
     "apk": r'''
 root         ::= command ("\n" command)* "\n"?
@@ -516,14 +516,50 @@ def grammar_for_pkg(pkg_mgr: str) -> str | None:
     return PKG_MGR_GRAMMARS.get(pkg_mgr)
 
 
+def pkg_guidance_line(facts: dict | None = None) -> str:
+    """One stable sentence naming the host's package manager, or '' if unknown.
+
+    This is the distro_guidance alternative to the full facts block: the block
+    is measured harmful on the shipped model (see module docstring), but a
+    wrong-distro install command remains a real failure. Three constraints
+    shape the wording. The shipped model is small (Qwen2.5-1.5B finetune) and
+    weighs early tokens heavily, so the manager's name sits inside the first
+    few tokens rather than at the end of the line. Foreign package managers
+    are deliberately NOT named -- see the note in stable_block(): naming a
+    wrong tool, even to ban it, primes a small model toward it. And the line
+    must be byte-identical per host, because it joins the prefix-cached system
+    prompt; any per-query variation would turn the once-per-session prefill
+    cost into a per-query one.
+    """
+    f = facts or stable_facts()
+    pkg = f.get("pkg", "unknown")
+    if pkg == "unknown":
+        return ""
+    return ("<constraint>\n"
+            f"This machine manages packages exclusively with {pkg}; "
+            f"install, update, and remove software only with {pkg}.\n"
+            "</constraint>")
+
+
 def build(prompt: str, enabled: bool = True, cwd: Path | None = None,
-          include_volatile: bool = True) -> tuple[str, str]:
-    """Return (system_prompt, user_message) with context folded in."""
-    if not enabled:
+          include_volatile: bool = True, pkg_line: bool = False) -> tuple[str, str]:
+    """Return (system_prompt, user_message) with context folded in.
+
+    pkg_line folds in just pkg_guidance_line() instead of the full block, for
+    the opt-in distro_guidance mode. It has no effect when the full block is
+    already enabled (the block subsumes the line).
+    """
+    if not enabled and not pkg_line:
         return cfg_mod.SYSTEM_PROMPT, prompt
-    system = cfg_mod.SYSTEM_PROMPT + "\n\n" + stable_block()
+    parts = [cfg_mod.SYSTEM_PROMPT]
+    if enabled:
+        parts.append(stable_block())
+    else:
+        line = pkg_guidance_line()
+        if line:
+            parts.append(line)
     if include_volatile:
         user = volatile_block(cwd) + "\n\n<request>\n" + prompt + "\n</request>"
     else:
         user = prompt
-    return system, user
+    return "\n\n".join(parts), user
