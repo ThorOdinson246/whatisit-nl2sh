@@ -5,12 +5,19 @@ model file: engine._post / engine._query_server / engine.start_server are all
 monkeypatched, and "model" paths are just empty tmp_path files that only need
 to exist.
 """
+import json
+import math
 import os
+import signal
 import socket
 import stat
+import subprocess
 import sys
+import threading
+import time
 import urllib.error
 import urllib.request
+from types import SimpleNamespace
 
 import pytest
 
@@ -1130,3 +1137,631 @@ class TestGenerateGrammarAndPostprocess:
         for flag in ("--file", "--system-prompt-file", "--grammar-file"):
             path = cmd[cmd.index(flag) + 1]
             assert not os.path.exists(path)
+
+
+# ------------------------------------------------------- stopping the server
+
+class TestStopServerOwnership:
+    def _isolate(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("WHATISIT_CONFIG_DIR", str(tmp_path / "cfg"))
+        monkeypatch.setenv("WHATISIT_DATA_DIR", str(tmp_path / "data"))
+        sd = tmp_path / "data" / "run"
+        sd.mkdir(parents=True)
+        return sd
+
+    @pytest.mark.parametrize("gone,record_kept,verdict",
+                             [(True, False, False), (False, True, None)])
+    def test_stop_server_spares_a_process_that_is_not_ours(
+            self, monkeypatch, tmp_path, gone, record_kept, verdict):
+        # Never ours, so never signalled. But a pid that is still alive may be
+        # ours and merely unattributable, and wiping the record then strands a
+        # resident server nothing can find. A dead pid is just a stale record.
+        sd = self._isolate(monkeypatch, tmp_path)
+        for name in ("server.pid", "server.port", "server.params"):
+            (sd / name).write_text("99999\n")
+        killed = []
+        monkeypatch.setattr(engine, "_is_our_server", lambda pid: False)
+        monkeypatch.setattr(engine, "_pid_gone", lambda pid: gone)
+        monkeypatch.setattr(engine.os, "kill",
+                            lambda pid, sig: killed.append(sig))
+        # None, not False: a live pid we could not attribute is not the same
+        # answer as nothing to stop, and cmd_stop has to say so.
+        assert engine.stop_server() is verdict
+        assert killed == []
+        assert (sd / "server.pid").exists() is record_kept
+        assert (sd / "server.params").exists() is record_kept
+
+    @pytest.mark.skipif(sys.platform == "win32",
+                        reason="no SIGKILL on Windows; _terminate returns before it")
+    def test_stop_server_escalates_when_sigterm_is_ignored(
+            self, monkeypatch, tmp_path):
+        # The pid record is unlinked either way, so a survivor would keep the
+        # model resident with nothing left able to find it.
+        sd = self._isolate(monkeypatch, tmp_path)
+        (sd / "server.pid").write_text("99999\n")
+        sent = []
+        monkeypatch.setattr(engine, "_is_windows", lambda: False)
+        monkeypatch.setattr(engine, "_is_our_server", lambda pid: True)
+        monkeypatch.setattr(engine, "_pid_gone", lambda pid: False)
+        monkeypatch.setattr(engine, "_STOP_WAIT", 0.0)
+        monkeypatch.setattr(engine.os, "kill",
+                            lambda pid, sig: sent.append(sig))
+        assert engine.stop_server() is False
+        assert sent == [signal.SIGTERM, signal.SIGKILL]
+
+    def test_terminate_does_not_escalate_on_windows(self, monkeypatch):
+        # TerminateProcess is already unconditional, and there is no SIGKILL
+        # to fall back to. Faked, so the branch is covered off Windows too.
+        sent = []
+        monkeypatch.setattr(engine, "_is_windows", lambda: True)
+        monkeypatch.setattr(engine.os, "kill", lambda pid, sig: sent.append(sig))
+        assert engine._terminate(4242) is True
+        assert sent == [signal.SIGTERM]
+
+    @pytest.mark.parametrize("cmdline,expected", [
+        ("/opt/l/bin/llama-server --port 8080", True),
+        ("tail -f /opt/l/bin/llama-server.log", False),
+        ("vim /opt/l/bin/llama-server.cpp", False),
+        ("", False),
+    ])
+    def test_is_our_server_needs_the_binary_as_an_argument(
+            self, monkeypatch, tmp_path, cmdline, expected):
+        # The bystander that got killed was a tail of the server's own log.
+        self._isolate(monkeypatch, tmp_path)
+        monkeypatch.setattr(engine, "_is_windows", lambda: False)
+        monkeypatch.setattr(engine, "_pid_cmdline", lambda pid: cmdline)
+        monkeypatch.setattr(engine, "_read_params",
+                            lambda: {"server_bin": "/opt/l/bin/llama-server"})
+        assert engine._is_our_server(4242) is expected
+
+    def test_params_are_recorded_when_the_server_never_becomes_ready(
+            self, monkeypatch, tmp_path):
+        # A start that times out still leaves a pid. Without the params beside
+        # it, stop_server cannot attribute that pid and falls back to a looser
+        # test, which is the state a user is in when they reach for `stop`.
+        sd = self._isolate(monkeypatch, tmp_path)
+        model, srv = tmp_path / "m.gguf", tmp_path / "llama-server"
+        model.write_bytes(b"x")
+        srv.write_bytes(b"x")
+        monkeypatch.setattr(engine.subprocess, "Popen",
+                            lambda *a, **k: SimpleNamespace(pid=4242,
+                                                            poll=lambda: None))
+        monkeypatch.setattr(engine, "_alive", lambda *a, **k: False)
+        with pytest.raises(RuntimeError):
+            engine.start_server(model, srv, threads=1, wait=0.0, quiet=True)
+        assert (sd / "server.pid").read_text().strip() == "4242"
+        assert json.loads((sd / "server.params").read_text())["server_bin"] == str(srv)
+
+    def test_legacy_state_without_params_still_rejects_a_log_path(
+            self, monkeypatch, tmp_path):
+        # Pre-0.3.1 state dirs have no server_bin. The name still has to be a
+        # whole argument, or the original bystander kill comes straight back.
+        self._isolate(monkeypatch, tmp_path)
+        monkeypatch.setattr(engine, "_is_windows", lambda: False)
+        monkeypatch.setattr(engine, "_read_params", lambda: None)
+        monkeypatch.setattr(engine, "_pid_cmdline",
+                            lambda pid: "tail -f /opt/l/llama-server.log")
+        assert engine._is_our_server(4242) is False
+        monkeypatch.setattr(engine, "_pid_cmdline",
+                            lambda pid: "/opt/l/bin/llama-server --port 8080")
+        assert engine._is_our_server(4242) is True
+
+    def test_legacy_state_matches_a_windows_image_name(
+            self, monkeypatch, tmp_path):
+        # tasklist reports `llama-server.exe`, and the loose substring test this
+        # replaces accepted it. Without the suffix we would refuse to stop a
+        # pre-upgrade Windows server, which is the only way to reach here.
+        self._isolate(monkeypatch, tmp_path)
+        monkeypatch.setattr(engine, "_is_windows", lambda: True)
+        monkeypatch.setattr(engine, "_read_params", lambda: None)
+        monkeypatch.setattr(engine, "_pid_cmdline",
+                            lambda pid: " llama-server.exe   4242 Console  1  1 612 344 K \n")
+        assert engine._is_our_server(4242) is True
+        monkeypatch.setattr(engine, "_pid_cmdline",
+                            lambda pid: " notepad.exe   4242 Console  1  9 000 K \n")
+        assert engine._is_our_server(4242) is False
+
+    def test_ps_output_is_not_rewritten(self, monkeypatch, tmp_path):
+        # The tasklist CSV normalisation must not reach ps: a comma there is
+        # part of an argument, and blanking it can forge a matching token.
+        self._isolate(monkeypatch, tmp_path)
+        out = "/usr/bin/python3 -c x --data=a,/opt/l/bin/llama-server,b"
+        monkeypatch.setattr(engine, "_is_windows", lambda: False)
+        monkeypatch.setattr(engine.subprocess, "run",
+                            lambda cmd, **k: SimpleNamespace(returncode=0, stdout=out))
+        assert engine._pid_cmdline(4242) == out
+        monkeypatch.setattr(engine, "_read_params",
+                            lambda: {"server_bin": "/opt/l/bin/llama-server"})
+        assert engine._is_our_server(4242) is False
+
+    def test_no_sigkill_once_the_pid_stopped_being_ours(
+            self, monkeypatch, tmp_path):
+        # SIGKILL cannot be caught, and the attribution is up to _STOP_WAIT old
+        # by the time it is sent.
+        self._isolate(monkeypatch, tmp_path)
+        sent = []
+        monkeypatch.setattr(engine, "_is_windows", lambda: False)
+        monkeypatch.setattr(engine, "_STOP_WAIT", 0.0)
+        monkeypatch.setattr(engine, "_pid_gone", lambda pid: False)
+        # stop_server already attributed this pid; by the re-check it is gone.
+        monkeypatch.setattr(engine, "_is_our_server", lambda pid: False)
+        monkeypatch.setattr(engine.os, "kill",
+                            lambda pid, sig: sent.append(sig))
+        assert engine._terminate(4242) is False
+        assert sent == [signal.SIGTERM]
+
+    def test_is_our_server_is_false_when_the_pid_is_gone(
+            self, monkeypatch, tmp_path):
+        self._isolate(monkeypatch, tmp_path)
+        monkeypatch.setattr(engine, "_pid_cmdline", lambda pid: None)
+        assert engine._is_our_server(4242) is False
+
+    def _child(self, request):
+        """A real child process, reaped whatever the test does.
+
+        It reports readiness on stdout: until exec has happened the child's
+        command line is still a copy of this process's own.
+        """
+        proc = subprocess.Popen(
+            [sys.executable, "-c",
+             "import sys, time; sys.stdout.write('x'); sys.stdout.flush();"
+             " time.sleep(60)"],
+            stdout=subprocess.PIPE)
+
+        def cleanup():
+            proc.kill()
+            proc.wait()
+            proc.stdout.close()
+
+        request.addfinalizer(cleanup)
+        assert proc.stdout.read(1) == b"x"
+        return proc
+
+    def _recorded_bin(self, proc):
+        """The argv[0] the OS actually reports for this child.
+
+        Not sys.executable: a macOS framework python re-execs itself, so ps
+        names the framework binary, and tasklist reports an image name rather
+        than a path. start_server records the binary it launched, which is the
+        same string this reads back.
+        """
+        cmdline = engine._pid_cmdline(proc.pid)
+        assert cmdline, "the child should still be running"
+        return cmdline.split()[0]
+
+    # --- real processes: the only way the Windows branch gets exercised, and
+    # CI runs windows-latest on 3.9 and 3.13.
+
+    def test_is_our_server_recognises_a_real_child(
+            self, monkeypatch, tmp_path, request):
+        self._isolate(monkeypatch, tmp_path)
+        proc = self._child(request)
+        binary = self._recorded_bin(proc)
+        monkeypatch.setattr(engine, "_read_params",
+                            lambda: {"server_bin": binary})
+        assert engine._is_our_server(proc.pid) is True
+
+    def test_is_our_server_rejects_a_real_unrelated_process(
+            self, monkeypatch, tmp_path, request):
+        self._isolate(monkeypatch, tmp_path)
+        proc = self._child(request)
+        monkeypatch.setattr(engine, "_read_params",
+                            lambda: {"server_bin": "/nowhere/llama-server"})
+        assert engine._is_our_server(proc.pid) is False
+
+    def test_is_our_server_is_false_for_a_pid_that_is_gone(
+            self, monkeypatch, tmp_path, request):
+        self._isolate(monkeypatch, tmp_path)
+        proc = self._child(request)
+        pid = proc.pid
+        proc.kill()
+        proc.wait()
+        monkeypatch.setattr(engine, "_read_params",
+                            lambda: {"server_bin": sys.executable})
+        assert engine._is_our_server(pid) is False
+
+    def test_terminate_actually_kills_a_real_process(
+            self, monkeypatch, tmp_path, request):
+        self._isolate(monkeypatch, tmp_path)
+        proc = self._child(request)
+        began = time.time()
+        assert engine._terminate(proc.pid) is True
+        # A process that takes SIGTERM must not cost the escalation window.
+        assert time.time() - began < 0.5
+        assert proc.wait(timeout=10) is not None
+
+    @pytest.mark.skipif(sys.platform == "win32",
+                        reason="no SIGKILL, and SIG_IGN for SIGTERM is not honoured")
+    def test_terminate_reaps_the_zombie_it_creates(
+            self, monkeypatch, tmp_path, request):
+        # A SIGKILLed child is a zombie until it is reaped, and a zombie still
+        # answers signal 0. Without the reap after SIGKILL, _terminate reports
+        # failure for a server it just killed and `stop` says none was running.
+        self._isolate(monkeypatch, tmp_path)
+        proc = subprocess.Popen(
+            [sys.executable, "-c",
+             "import signal, sys, time;"
+             " signal.signal(signal.SIGTERM, signal.SIG_IGN);"
+             " sys.stdout.write('x'); sys.stdout.flush(); time.sleep(60)"],
+            stdout=subprocess.PIPE)
+
+        def cleanup():
+            proc.kill()
+            proc.wait()
+            proc.stdout.close()
+
+        request.addfinalizer(cleanup)
+        assert proc.stdout.read(1) == b"x"
+        monkeypatch.setattr(engine, "_read_params",
+                            lambda: {"server_bin": self._recorded_bin(proc)})
+        monkeypatch.setattr(engine, "_STOP_WAIT", 0.3)
+        assert engine._terminate(proc.pid) is True
+        assert proc.wait(timeout=10) is not None
+
+    def test_stop_server_kills_a_real_child_end_to_end(
+            self, monkeypatch, tmp_path, request):
+        sd = self._isolate(monkeypatch, tmp_path)
+        proc = self._child(request)
+        (sd / "server.pid").write_text(f"{proc.pid}\n")
+        (sd / "server.params").write_text(
+            json.dumps({"server_bin": self._recorded_bin(proc)}))
+        assert engine.stop_server() is True
+        assert proc.wait(timeout=10) is not None
+        assert not (sd / "server.pid").exists()
+
+    def test_windows_ownership_reads_tasklist_output(self, monkeypatch, tmp_path):
+        # Pinned against a recorded sample so the CSV shape is checked on every
+        # platform, not only when CI happens to be on Windows.
+        self._isolate(monkeypatch, tmp_path)
+        sample = '"llama-server.exe","4242","Console","1","1,612,344 K"\n'
+        argv = []
+        monkeypatch.setattr(engine, "_is_windows", lambda: True)
+        monkeypatch.setattr(engine.subprocess, "run",
+                            lambda cmd, **k: (argv.append(cmd),
+                                              SimpleNamespace(returncode=0,
+                                                              stdout=sample))[1])
+        monkeypatch.setattr(engine, "_read_params",
+                            lambda: {"server_bin": "C:\\llama\\llama-server.exe"})
+        assert engine._is_our_server(4242) is True
+        assert argv[0][0] == "tasklist" and "PID eq 4242" in argv[0]
+        monkeypatch.setattr(engine, "_read_params",
+                            lambda: {"server_bin": "C:\\llama\\other.exe"})
+        assert engine._is_our_server(4242) is False
+
+    def test_pid_gone_never_signals_on_windows(self, monkeypatch):
+        # os.kill(pid, 0) calls TerminateProcess there, so it must not run.
+        monkeypatch.setattr(engine, "_is_windows", lambda: True)
+        monkeypatch.setattr(engine.os, "kill",
+                            lambda *a: pytest.fail("os.kill reached on Windows"))
+        assert engine._pid_gone(4242) is False
+
+
+# ------------------------------------------------------------ idle timeout
+
+class TestIdleTimeout:
+    """--idle-timeout: the user-space watchdog unloads the resident
+    llama-server at N idle seconds. llama-server's own --sleep-idle-seconds
+    (the CVE-2026-43631 trigger) is never passed -- pinned by a launch-argv
+    guard below."""
+
+    def _isolate(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("WHATISIT_CONFIG_DIR", str(tmp_path / "cfg"))
+        monkeypatch.setenv("WHATISIT_DATA_DIR", str(tmp_path / "data"))
+        sd = tmp_path / "data" / "run"
+        sd.mkdir(parents=True)
+        return sd
+
+    def _seed_running(self, sd, *, timeout=300, age=400.0):
+        (sd / "server.pid").write_text("99999\n")
+        (sd / "server.watch").write_text(f"{timeout}\n")
+        if age is not None:
+            (sd / "server.last_use").write_text(f"{time.time() - age:.6f}\n")
+
+    @pytest.mark.parametrize("raw,want", [
+        (None, None), (0, None), (-3, None), ("tomorrow", None), ([], None),
+        (300, 300), ("300", 300),
+    ])
+    def test_coerce_idle_timeout(self, raw, want):
+        assert engine._coerce_idle_timeout(raw) == want
+
+    def test_touch_last_use_only_when_enabled(self, monkeypatch, tmp_path):
+        self._isolate(monkeypatch, tmp_path)
+        engine.touch_last_use(0)
+        engine.touch_last_use("tomorrow")
+        engine.touch_last_use(None)
+        assert not engine._last_use_path().exists()
+        engine.touch_last_use(300)
+        # nan would silently disarm every deadline; must never be written.
+        assert math.isfinite(float(engine._last_use_path().read_text()))
+    @pytest.mark.skipif(sys.platform == "win32", reason="chmod is a no-op on Windows")
+    def test_touch_writes_private_timestamp(self, monkeypatch, tmp_path):
+        self._isolate(monkeypatch, tmp_path)
+        engine.touch_last_use(300)
+        assert stat.S_IMODE(os.stat(engine._last_use_path()).st_mode) == 0o600
+
+    def test_idle_stop_disabled_is_a_noop(self, monkeypatch, tmp_path):
+        sd = self._isolate(monkeypatch, tmp_path)
+        self._seed_running(sd)
+        assert engine.idle_stop(0) is False
+        assert engine.idle_stop("garbage") is False
+        assert (sd / "server.pid").exists()
+
+    def test_idle_stop_fires_when_stale_and_running(self, monkeypatch, tmp_path):
+        sd = self._isolate(monkeypatch, tmp_path)
+        self._seed_running(sd, age=400.0, timeout=300)
+        killed = []
+        monkeypatch.setattr(engine, "_is_our_server", lambda pid: True)
+        monkeypatch.setattr(engine, "_pid_gone", lambda pid: True)
+        monkeypatch.setattr(engine.os, "kill",
+                            lambda pid, sig: killed.append((pid, sig)))
+        assert engine.idle_stop(300) is True
+        assert killed == [(99999, signal.SIGTERM)]
+        for name in ("server.pid", "server.watch", "server.last_use"):
+            assert not (sd / name).exists()
+
+    def test_idle_stop_returns_a_bool_when_the_server_is_left_alone(
+            self, monkeypatch, tmp_path):
+        # stop_server is tri-state now; idle_stop's own contract is not.
+        sd = self._isolate(monkeypatch, tmp_path)
+        self._seed_running(sd, age=400.0, timeout=300)
+        monkeypatch.setattr(engine, "stop_server", lambda: None)
+        assert engine.idle_stop(300) is False
+
+    @pytest.mark.parametrize("content", [
+        "fresh",                       # built at test time, inside the window
+        None,                          # missing file
+        "junk\n", "nan\n", "inf\n",    # corrupt / non-finite
+    ])
+    def test_idle_stop_ignores_fresh_missing_and_corrupt(
+            self, monkeypatch, tmp_path, content):
+        sd = self._isolate(monkeypatch, tmp_path)
+        killed = []
+        monkeypatch.setattr(engine, "_is_our_server", lambda pid: True)
+        monkeypatch.setattr(engine.os, "kill",
+                            lambda pid, sig: killed.append(sig))
+        self._seed_running(sd)
+        if content is None:
+            engine._last_use_path().unlink(missing_ok=True)
+        else:
+            stamp = f"{time.time() - 5:.6f}\n" if content == "fresh" else content
+            engine._last_use_path().write_text(stamp)
+        assert engine.idle_stop(300) is False
+        assert killed == []
+
+    def test_stop_server_clears_watchdog_state(self, monkeypatch, tmp_path):
+        sd = self._isolate(monkeypatch, tmp_path)
+        names = ("server.pid", "server.port", "server.sock", "server.token",
+                 "server.params", "server.last_use", "server.watch")
+        for name in names:
+            (sd / name).write_text("99999\n" if name == "server.pid" else "x\n")
+        monkeypatch.setattr(engine, "_is_our_server", lambda pid: True)
+        monkeypatch.setattr(engine, "_pid_gone", lambda pid: True)
+        monkeypatch.setattr(engine.os, "kill", lambda pid, sig: None)
+        assert engine.stop_server() is True
+        for name in names:
+            assert not (sd / name).exists(), name
+    def test_spawn_watchdog_runs_outside_the_caller_cwd(
+            self, monkeypatch, tmp_path):
+        # -m puts cwd first on sys.path, so a whatisit/ package in whatever
+        # directory the user happens to be in would be imported instead.
+        sd = self._isolate(monkeypatch, tmp_path)
+        seen = {}
+
+        def fake_popen(argv, **kw):
+            seen["argv"], seen["cwd"] = argv, kw.get("cwd")
+
+        monkeypatch.setattr(engine.subprocess, "Popen", fake_popen)
+        engine._spawn_watchdog()
+        assert seen["argv"][1:] == ["-m", "whatisit.watchdog"]
+        assert seen["cwd"] == str(sd)
+
+    def test_launch_cmd_never_carries_an_idle_or_sleep_flag(
+            self, monkeypatch, tmp_path):
+        # THE regression guard for CVE-2026-43631: whatever else changes,
+        # llama-server must never see --sleep-idle-seconds or any idle flag.
+        model = tmp_path / "model.gguf"
+        server = tmp_path / "llama-server"
+        model.write_bytes(b"model")
+        server.write_bytes(b"binary")
+        sd = self._isolate(monkeypatch, tmp_path)
+        # Socket transport: forcing TCP would demand /proc or lsof BEFORE
+        # readiness even starts, which does not exist on Windows CI.
+        monkeypatch.setattr(engine, "running_port", lambda: None)
+
+        captured = {}
+
+        class Process:
+            pid = 2468
+            returncode = None
+
+            @staticmethod
+            def poll():
+                return None
+
+        def fake_popen(cmd, **kwargs):
+            captured["cmd"] = list(cmd)
+            return Process()
+
+        monkeypatch.setattr(engine.subprocess, "Popen", fake_popen)
+        monkeypatch.setattr(engine, "_alive", lambda *a, **k: False)
+        with pytest.raises(RuntimeError, match="did not become ready"):
+            engine.start_server(model, server, threads=2, wait=0.05,
+                                quiet=True)
+
+        cmd = captured["cmd"]
+        assert "--sleep-idle-seconds" not in cmd
+        # Scope to flag-shaped args: the model/bin paths are caller-supplied
+        # tmp_path strings and may legitimately contain any substring.
+        flags = [a for a in cmd if isinstance(a, str) and a.startswith("-")]
+        assert not any("sleep" in f.lower() or "idle" in f.lower()
+                       for f in flags), cmd
+        # The launch itself stays untouched by the feature.
+        assert not (sd / "server.watch").exists()
+        assert not (sd / "server.last_use").exists()
+
+    def _generate_env(self, monkeypatch, tmp_path):
+        model = tmp_path / "model.gguf"
+        model.write_bytes(b"model")
+        sd = self._isolate(monkeypatch, tmp_path)
+        monkeypatch.setenv("WHATISIT_MODEL", str(model))
+        monkeypatch.setenv("WHATISIT_LLAMA_SERVER", str(model))  # exists == bin
+        return sd
+
+    def test_generate_wires_the_watchdog_in_order(self, monkeypatch, tmp_path):
+        sd = self._generate_env(monkeypatch, tmp_path)
+        order = []
+        real_touch = engine.touch_last_use
+
+        def spy_touch(v):
+            order.append("touch")
+            return real_touch(v)
+
+        def fake_start(*a, **k):
+            order.append("start")
+            return 8080
+
+        def spy_query(*a, **k):
+            order.append("query")
+            return [("echo hi", None)]
+
+        monkeypatch.setattr(engine.hostctx, "build",
+                            lambda p, enabled=True, include_volatile=True:
+                            ("SYS", p))
+        monkeypatch.setattr(engine.cfg_mod, "resolve_threads", lambda cfg: 2)
+        monkeypatch.setattr(engine, "idle_stop",
+                            lambda v: order.append("lazy") or False)
+        monkeypatch.setattr(engine, "start_server", fake_start)
+        monkeypatch.setattr(engine, "touch_last_use", spy_touch)
+        monkeypatch.setattr(engine, "_query_server", spy_query)
+        monkeypatch.setattr(engine, "_spawn_watchdog",
+                            lambda: order.append("spawn"))
+
+        cmds, _, mode = engine.generate("list files",
+                                        {"idle_timeout": 300,
+                                         "host_context": False})
+        assert mode == "server" and cmds == ["echo hi"]
+        # Lazy check first, start, pre-touch BEFORE the query (a long
+        # inference must not look idle), spawn, then post-touch on success.
+        assert order == ["lazy", "start", "touch", "spawn", "query", "touch"]
+        assert (sd / "server.watch").read_text() == "300\n"
+
+    def test_heartbeat_covers_an_inference_longer_than_the_deadline(
+            self, monkeypatch, tmp_path):
+        # CodeRabbit Major on this PR: pre/post touches alone let an
+        # inference OUTLIVING idle_timeout look idle -- a 45 s generation
+        # under --idle-timeout 30 would be killed at t=30. While the query
+        # blocks, the heartbeat must keep re-arming server.last_use.
+        self._generate_env(monkeypatch, tmp_path)
+        monkeypatch.setattr(engine.hostctx, "build",
+                            lambda p, enabled=True, include_volatile=True:
+                            ("SYS", p))
+        monkeypatch.setattr(engine.cfg_mod, "resolve_threads", lambda cfg: 2)
+        monkeypatch.setattr(engine, "idle_stop", lambda v: False)
+        monkeypatch.setattr(engine, "start_server", lambda *a, **k: 8080)
+        monkeypatch.setattr(engine, "_spawn_watchdog", lambda: None)
+
+        seen = {}
+
+        def slow_query(*a, **k):
+            first = float(engine._last_use_path().read_text())
+            # Block past one beat interval, watching for a refresh.
+            deadline = time.monotonic() + 2.0
+            while time.monotonic() < deadline:
+                if float(engine._last_use_path().read_text()) - first > 0.05:
+                    break
+                time.sleep(0.01)
+            seen["refreshed"] = \
+                float(engine._last_use_path().read_text()) - first > 0.05
+            return [("echo hi", None)]
+
+        monkeypatch.setattr(engine, "_query_server", slow_query)
+        cmds, _, mode = engine.generate("list files",
+                                        {"idle_timeout": 1,
+                                         "host_context": False})
+        assert mode == "server" and cmds == ["echo hi"]
+        assert seen["refreshed"] is True
+
+    def test_no_heartbeat_thread_when_disabled(self, monkeypatch, tmp_path):
+        self._generate_env(monkeypatch, tmp_path)
+        threads_before = threading.active_count()
+        monkeypatch.setattr(engine.hostctx, "build",
+                            lambda p, enabled=True, include_volatile=True:
+                            ("SYS", p))
+        monkeypatch.setattr(engine.cfg_mod, "resolve_threads", lambda cfg: 2)
+        monkeypatch.setattr(engine, "start_server", lambda *a, **k: 8080)
+        monkeypatch.setattr(engine, "_query_server",
+                            lambda *a, **k: [("echo hi", None)])
+        engine.generate("list files", {"idle_timeout": 0,
+                                       "host_context": False})
+        assert threading.active_count() == threads_before
+
+    def test_generate_disabled_retracts_a_live_watchdog(
+            self, monkeypatch, tmp_path):
+        sd = self._generate_env(monkeypatch, tmp_path)
+        # A previous --idle-timeout window left instructions behind.
+        (sd / "server.watch").write_text("300\n")
+        (sd / "server.last_use").write_text(f"{time.time():.6f}\n")
+        spawned = []
+        monkeypatch.setattr(engine.hostctx, "build",
+                            lambda p, enabled=True, include_volatile=True:
+                            ("SYS", p))
+        monkeypatch.setattr(engine.cfg_mod, "resolve_threads", lambda cfg: 2)
+        monkeypatch.setattr(engine, "start_server", lambda *a, **k: 8080)
+        monkeypatch.setattr(engine, "_query_server",
+                            lambda *a, **k: [("echo hi", None)])
+        monkeypatch.setattr(engine, "_spawn_watchdog",
+                            lambda: spawned.append(1))
+        engine.generate("list files", {"idle_timeout": 0,
+                                       "host_context": False})
+        assert spawned == []
+        assert not (sd / "server.watch").exists()
+        assert not (sd / "server.last_use").exists()
+
+    def test_generate_oneshot_never_touches_or_spawns(self, monkeypatch,
+                                                      tmp_path):
+        sd = self._generate_env(monkeypatch, tmp_path)
+        cli_bin = tmp_path / "llama-cli"
+        cli_bin.write_bytes(b"cli")
+        monkeypatch.delenv("WHATISIT_LLAMA_SERVER")
+        monkeypatch.setattr(engine.cfg_mod, "find_llama_cli",
+                            lambda: cli_bin)
+        monkeypatch.setattr(engine, "_query_oneshot",
+                            lambda *a, **k: [("echo hi", None)])
+        spawned = []
+        monkeypatch.setattr(engine, "_spawn_watchdog",
+                            lambda: spawned.append(1))
+        engine.generate("list files", {"idle_timeout": 300,
+                                       "host_context": False},
+                        force_oneshot=True)
+        assert spawned == []
+        assert not (sd / "server.watch").exists()
+        assert not (sd / "server.last_use").exists()
+
+    def test_spawn_failure_still_unloads_via_lazy_fallback(
+            self, monkeypatch, tmp_path):
+        # No fork available: the query must still succeed, and an already-
+        # stale server must still have been unloaded by the lazy check.
+        sd = self._generate_env(monkeypatch, tmp_path)
+        self._seed_running(sd, age=99999.0, timeout=300)
+        killed = []
+        monkeypatch.setattr(engine, "_is_our_server", lambda pid: True)
+        monkeypatch.setattr(engine, "_pid_gone", lambda pid: True)
+        monkeypatch.setattr(engine.os, "kill",
+                            lambda pid, sig: killed.append(sig))
+        monkeypatch.setattr(engine.hostctx, "build",
+                            lambda p, enabled=True, include_volatile=True:
+                            ("SYS", p))
+        monkeypatch.setattr(engine.cfg_mod, "resolve_threads", lambda cfg: 2)
+        monkeypatch.setattr(engine, "start_server", lambda *a, **k: 8080)
+        monkeypatch.setattr(engine, "_query_server",
+                            lambda *a, **k: [("echo hi", None)])
+
+        def no_fork(*a, **k):
+            raise OSError("cannot fork")
+
+        monkeypatch.setattr(engine.subprocess, "Popen", no_fork)
+        cmds, _, mode = engine.generate("list files",
+                                        {"idle_timeout": 300,
+                                         "host_context": False})
+        assert mode == "server" and cmds == ["echo hi"]
+        assert killed == [signal.SIGTERM]

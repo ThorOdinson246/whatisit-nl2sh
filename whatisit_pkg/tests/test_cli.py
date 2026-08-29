@@ -12,6 +12,7 @@ None of this starts a server or touches the network: engine.generate is
 monkeypatched wherever cmd_query would otherwise call into it.
 """
 import os
+from types import SimpleNamespace
 
 import pytest
 
@@ -114,6 +115,18 @@ class TestSubcommandRoutingIsFirstTokenOnly:
 # --------------------------------------------------------------- cmd_query
 
 class TestCmdQueryQuietDangerRefusal:
+    def test_quiet_stdout_carries_only_the_command(self, monkeypatch, capsys):
+        """`eval "$(whatisit -q ...)"` runs whatever lands on stdout."""
+        monkeypatch.setattr(
+            cli.engine, "generate",
+            lambda prompt, cfg, n=1, force_oneshot=False, quiet=False, for_execution=False:
+                (["chmod 777 ./build"], 0.01, "server"))
+        rc = cli.main(["-q", "fix", "permissions"])
+        cap = capsys.readouterr()
+        assert rc == 0
+        assert cap.out == "chmod 777 ./build\n"
+        assert "caution" in cap.err
+
     def test_quiet_refuses_danger_command_exit_6(self, monkeypatch, capsys):
         monkeypatch.setattr(
             cli.engine, "generate",
@@ -157,6 +170,25 @@ class TestCmdQueryQuietDangerRefusal:
         assert cli.main(["-e", "list", "files"]) == 6
         assert captured["for_execution"] is True
 
+    def test_execute_refuses_a_danger_command_and_never_runs_it(
+            self, monkeypatch, capsys):
+        # Inverting `if danger:` used to leave the whole suite green. Everything
+        # downstream is set up to say yes, so only the refusal stops the run.
+        ran = []
+        monkeypatch.setattr(cli, "_is_windows", lambda: False)
+        monkeypatch.setattr(cli.sys.stdin, "isatty", lambda: True)
+        monkeypatch.setattr("builtins.input", lambda *a: "y")
+        monkeypatch.setattr(cli.subprocess, "run",
+                            lambda argv, **kw: (ran.append(argv),
+                                                SimpleNamespace(returncode=0))[1])
+        monkeypatch.setattr(
+            cli.engine, "generate",
+            lambda prompt, cfg, n=1, force_oneshot=False, quiet=False, for_execution=False:
+                (["rm -rf /"], 0.01, "server"))
+        assert cli.main(["-e", "-y", "delete", "everything"]) == 6
+        assert ran == []
+        assert "DANGER" in capsys.readouterr().err
+
     def test_no_model_found_reports_and_exits_3(self, monkeypatch):
         def raise_not_found(prompt, cfg, n=1, force_oneshot=False, quiet=False,
                             for_execution=False):
@@ -192,6 +224,25 @@ class TestCmdQueryQuietDangerRefusal:
         rc = cli.main(["-e", "list", "files"])
         assert rc != 7
         assert "disabled" not in capsys.readouterr().err
+
+# -------------------------------------------------------------------- stop
+
+class TestCmdStop:
+    @pytest.mark.parametrize("verdict,rc,needle,stream", [
+        (True,  0, "server stopped",    "out"),
+        (False, 0, "no server running", "out"),
+        (None,  1, "left it alone",     "err"),
+    ])
+    def test_reports_each_outcome(self, monkeypatch, capsys, verdict, rc,
+                                  needle, stream):
+        # None is the case the tri-state exists for: something is running on
+        # the recorded pid and we declined to touch it. Saying "no server
+        # running" there is the opposite of the truth.
+        monkeypatch.setattr(cli.engine, "stop_server", lambda: verdict)
+        assert cli.main(["stop"]) == rc
+        cap = capsys.readouterr()
+        assert needle in (cap.out if stream == "out" else cap.err)
+
 
 # ------------------------------------------------------------------ parser
 
@@ -444,3 +495,74 @@ class TestQueryFlagsApply:
         assert "--debug" in err
         assert "grammar-blob" in err
         assert "list files" in err
+
+
+# ------------------------------------------------------- --idle-timeout (#42)
+
+class TestIdleTimeoutFlag:
+    """Per-invocation idle-unload deadline, following the --port/--threads
+    value-flag pattern. The feature is the user-space watchdog; llama-server's
+    own --sleep-idle-seconds (the CVE-2026-43631 trigger) never appears."""
+
+    def _isolate(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("WHATISIT_CONFIG_DIR", str(tmp_path / "cfg"))
+        monkeypatch.setenv("WHATISIT_DATA_DIR", str(tmp_path / "data"))
+
+    def test_flag_parses(self):
+        a = cli.QueryArgs(["--idle-timeout", "300", "list", "files"])
+        assert a.idle_timeout == 300
+        assert a.words == ["list", "files"]
+
+    def test_defaults_to_none_when_absent(self):
+        assert cli.QueryArgs(["list", "files"]).idle_timeout is None
+
+    def test_missing_value_raises(self):
+        with pytest.raises(ValueError, match="needs a value"):
+            cli.QueryArgs(["--idle-timeout"])
+
+    def test_negative_rejected_zero_accepted(self):
+        with pytest.raises(ValueError, match="must be >= 0"):
+            cli.QueryArgs(["--idle-timeout", "-1", "list", "files"])
+        assert cli.QueryArgs(["--idle-timeout", "0",
+                              "list", "files"]).idle_timeout == 0
+
+    def test_stray_flag_is_reported_not_applied(self):
+        # After the request text starts, the flag belongs to the question.
+        a = cli.QueryArgs(["list", "files", "--idle-timeout", "300"])
+        assert a.idle_timeout is None
+        assert a.stray_flags == ["--idle-timeout"]
+
+    def _capture_generate(self, monkeypatch, seen):
+        monkeypatch.setattr(cli.engine, "generate",
+                            lambda prompt, cfg, **k:
+                                seen.update(cfg=dict(cfg))
+                                or (["ls"], 0.01, "server"))
+
+    def test_override_reaches_cmd_query(self, monkeypatch, tmp_path):
+        self._isolate(monkeypatch, tmp_path)
+        seen = {}
+        self._capture_generate(monkeypatch, seen)
+        assert cli.main(["--idle-timeout", "123", "list", "files"]) == 0
+        assert seen["cfg"]["idle_timeout"] == 123
+
+    def test_absent_leaves_default_and_zero_overrides_saved(
+            self, monkeypatch, tmp_path):
+        self._isolate(monkeypatch, tmp_path)
+        seen = {}
+        self._capture_generate(monkeypatch, seen)
+        assert cli.main(["list", "files"]) == 0
+        assert seen["cfg"]["idle_timeout"] == 0      # DEFAULTS: never unload
+        cli.main(["config", "--set", "idle_timeout=300"])
+        cap = {}
+        monkeypatch.setattr(cli.engine, "generate",
+                            lambda prompt, cfg, **k:
+                                cap.update(cfg=dict(cfg))
+                                or (["ls"], 0.01, "server"))
+        assert cli.main(["list", "files"]) == 0
+        assert cap["cfg"]["idle_timeout"] == 300     # persisted value wins
+        assert cli.main(["--idle-timeout", "0", "list", "files"]) == 0
+        assert cap["cfg"]["idle_timeout"] == 0       # explicit zero beats it
+        # Per-invocation overrides must NOT reach config.json (cmd_query's
+        # documented contract); the saved 300 has to survive untouched.
+        from whatisit import config as cfg_mod
+        assert cfg_mod.load_config()["idle_timeout"] == 300

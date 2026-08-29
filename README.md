@@ -1,7 +1,8 @@
 # whatisit-nl2sh
 
-Ask for a shell command in plain English. Runs on your own machine by default,
-on CPU. No GPU, no API key, no network. Answers in about a second.
+Ask for a shell command in plain English. Runs on your own machine on CPU, no
+GPU and no network. Answers in about a second. Optionally any OpenAI-compatible
+endpoint instead.
 
 ![whatisit in use](whatisit.gif)
 
@@ -122,6 +123,20 @@ whatisit -e remove every .pyc file under this tree
 `whatisit stop` shuts down the resident model server. `whatisit config --set threads=4`
 changes settings.
 
+### Unloading the model automatically
+
+The resident server holds the model in RAM. On a tight box, have it unload
+itself once it has been idle for a while:
+
+```bash
+whatisit --idle-timeout 300 show disk usage   # this invocation only
+whatisit config --set idle_timeout=300        # persist it (0 = never, default)
+```
+
+A watchdog stops the server at the deadline and frees the memory it was
+holding; the next query pays a cold start. The deadline is re-armed on every
+query, including one still running.
+
 ## Remote endpoints
 
 To use a hosted API, Ollama, or a `llama.cpp` server you already have running:
@@ -201,6 +216,17 @@ shell context to.
 † GPT-4o's number is the one published by the benchmark authors. Every other
 row I measured myself with the unmodified upstream scorer at temperature 0,
 `max_tokens=64`, embedding heuristic at threshold 0.75, icalfa 0.3.6.
+
+## Community Models
+
+While I keep iterating on the shipped model, here are community-trained alternatives
+worth trying — same base model family, different training recipes.
+
+| model | size | InterCode-ALFA (reported) |
+|---|---|---|
+| [nl2sh-qwen25-coder-1.5b](https://huggingface.co/barbarabhb/nl2sh-qwen25-coder-1.5b-GGUF) | 941 MB | 0.6567 |
+
+Thanks to lydorianP!
 
 ## Two sizes
 
