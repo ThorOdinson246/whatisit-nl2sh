@@ -196,10 +196,12 @@ def cmd_query(args, cfg: dict) -> int:
         for w in engine.remote_warnings(remote):
             warn(DIM(f"  note: {w}"))
 
+    active_prefill = args.prefill_command or cfg.get("prefill_command", False)
+
     try:
         cmds, elapsed, mode = engine.generate(
             prompt, cfg, n=args.num, force_oneshot=args.oneshot, quiet=args.quiet,
-            for_execution=args.execute or args.quiet)
+            for_execution=args.execute or args.quiet or active_prefill)
     except FileNotFoundError as e:
         warn(f"whatisit: {e}")
         return 3
@@ -254,7 +256,7 @@ def cmd_query(args, cfg: dict) -> int:
     if args.timing:
         warn(DIM(f"  [{elapsed:.2f}s, {mode} mode]"))
 
-    if not args.execute and not args.prefill_command:
+    if not args.execute and not active_prefill:
         return 0
 
     if _is_windows():
@@ -289,7 +291,7 @@ def cmd_query(args, cfg: dict) -> int:
         warn(DIM("Copy it and run it yourself if you are certain."))
         return 6
 
-    if args.prefill_command or cfg.get("prefill_command", False):
+    if active_prefill:
         if not sys.stdin.isatty():
             print("whatisit: -p/--prefill-command is not supported with TTY", file=sys.stderr)
         if _is_windows():
