@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "whatisit"
-version = "0.3.0"
+version = "0.4.0"
 description = "Natural language to shell command. Runs on your own machine on CPU, no GPU and no network; optionally any OpenAI-compatible endpoint."
 readme = "README.md"
 requires-python = ">=3.9"
