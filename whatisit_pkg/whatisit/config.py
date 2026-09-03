@@ -96,6 +96,7 @@ DEFAULTS = {
     # commands unless the user opted in. Set confirm_default=true to get [Y/n]
     # (empty answer means yes) on the confirmation prompt.
     "confirm_default": False,
+    "prefill_command": False,
     # OFF by default. It is cheap (prefix-cached) but MEASURED HARMFUL on the
     # only benchmark available: 54.2% -> 45.1% pass, p=0.0004. See hostctx.py.
     "host_context": False,

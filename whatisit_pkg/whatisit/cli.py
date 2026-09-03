@@ -140,6 +140,14 @@ def _emit_debug(prompt: str, system: str, user_msg: str, grammar: str | None) ->
         warn(DIM(f"  --debug: GBNF grammar:\n{grammar}"))
     warn(DIM(f"  --debug: request:\n{prompt}"))
 
+def _exec_cmd(cmd: str) -> int:
+    warn(DIM(f"$ {cmd}"))
+    shell = os.environ.get("SHELL", "/bin/bash")
+    try:
+        return subprocess.run([shell, "-c", cmd]).returncode
+    except FileNotFoundError:
+        print(f"whatisit: the shell '{shell}' was not found")
+        return 8
 
 def cmd_query(args, cfg: dict) -> int:
     prompt = " ".join(args.words).strip()
@@ -188,10 +196,12 @@ def cmd_query(args, cfg: dict) -> int:
         for w in engine.remote_warnings(remote):
             warn(DIM(f"  note: {w}"))
 
+    active_prefill = args.prefill_command or cfg.get("prefill_command", False)
+
     try:
         cmds, elapsed, mode = engine.generate(
             prompt, cfg, n=args.num, force_oneshot=args.oneshot, quiet=args.quiet,
-            for_execution=args.execute or args.quiet)
+            for_execution=args.execute or args.quiet or active_prefill)
     except FileNotFoundError as e:
         warn(f"whatisit: {e}")
         return 3
@@ -246,7 +256,7 @@ def cmd_query(args, cfg: dict) -> int:
     if args.timing:
         warn(DIM(f"  [{elapsed:.2f}s, {mode} mode]"))
 
-    if not args.execute:
+    if not args.execute and not active_prefill:
         return 0
 
     if _is_windows():
@@ -281,6 +291,30 @@ def cmd_query(args, cfg: dict) -> int:
         warn(DIM("Copy it and run it yourself if you are certain."))
         return 6
 
+    if active_prefill:
+        if not sys.stdin.isatty():
+            print(
+                "whatisit: -p/--prefill-command requires an interactive terminal (TTY)",
+                file=sys.stderr
+            )
+            return 10
+        if _is_windows():
+            print("whatisit: -p/--prefill-command is not supported on Windows", file=sys.stderr)
+            return 9
+
+        import readline
+
+        readline.set_startup_hook(lambda: readline.insert_text(chosen))
+        try:
+            chosen = input(f"{BOLD('Command to be executed (editable)')}:\n")
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return 130
+        finally:
+            # Clear the hook so it doesn't affect future inputs
+            readline.set_startup_hook()
+        return _exec_cmd(chosen)
+
     if cfg.get("confirm_execute", True):
         if not sys.stdin.isatty():
             warn("whatisit: refusing to execute without an interactive confirmation.")
@@ -299,9 +333,7 @@ def cmd_query(args, cfg: dict) -> int:
             warn("whatisit: not running.")
             return 0
 
-    warn(DIM(f"$ {chosen}"))
-    shell = os.environ.get("SHELL", "/bin/bash")
-    return subprocess.run([shell, "-c", chosen]).returncode
+    return _exec_cmd(chosen)
 
 
 def _confirm(prompt: str, auto: bool) -> bool:
@@ -735,6 +767,8 @@ def build_parser() -> argparse.ArgumentParser:
                     help="bypass the resident server (slower; for debugging)")
     ap.add_argument("-y", "--yes", action="store_true",
                     help="with -e, treat an empty confirm answer as yes ([Y/n])")
+    ap.add_argument("-p", "--prefill-command", dest="prefill_command", action="store_true",
+                    help="prefill the terminal with the command")
     ap.add_argument("--port", type=int, metavar="PORT",
                     help="fixed TCP port for the resident server (1-65535)")
     ap.add_argument("--threads", type=int, metavar="N",
@@ -786,7 +820,8 @@ def build_parser() -> argparse.ArgumentParser:
 SUBCOMMANDS = {"setup", "doctor", "stop", "config"}
 _FLAGS_NOARG = {"-e", "--execute", "-q", "--quiet", "-t", "--timing", "--oneshot",
                 "--host-context", "--no-host-context",
-                "--grammar", "--no-grammar", "--debug", "-y", "--yes"}
+                "--grammar", "--no-grammar", "--debug", "-y", "--yes",
+                "-p", "--prefill-command"}
 _FLAGS_ARG = {"-n", "--num"}
 _FLAGS_QUERY_ARG = {"--port", "--threads", "--ctx-size", "--model",
                     "--idle-timeout"}
@@ -812,6 +847,7 @@ class QueryArgs:
         self.port, self.threads, self.ctx_size, self.model = None, None, None, None
         self.idle_timeout = None
         self.host_context, self.grammar, self.debug, self.yes = None, None, False, False
+        self.prefill_command = False
         i = 0
         while i < len(argv):
             a = argv[i]
@@ -829,6 +865,8 @@ class QueryArgs:
                     self.grammar = False
                 elif a in ("-y", "--yes"):
                     self.yes = True
+                elif a in ("-p", "--prefill-command"):
+                    self.prefill_command = True
                 else:
                     setattr(self, {"-e": "execute", "--execute": "execute",
                                    "-q": "quiet", "--quiet": "quiet",
