@@ -293,7 +293,11 @@ def cmd_query(args, cfg: dict) -> int:
 
     if active_prefill:
         if not sys.stdin.isatty():
-            print("whatisit: -p/--prefill-command is not supported with TTY", file=sys.stderr)
+            print(
+                "whatisit: -p/--prefill-command requires an interactive terminal (TTY)",
+                file=sys.stderr
+            )
+            return 10
         if _is_windows():
             print("whatisit: -p/--prefill-command is not supported on Windows", file=sys.stderr)
             return 9
