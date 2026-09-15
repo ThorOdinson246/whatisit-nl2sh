@@ -18,8 +18,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+from . import __version__, engine, fetch
 from . import config as cfg_mod
-from . import engine, fetch
 from .safety import check
 
 # Colour only when attached to a terminal, and honour NO_COLOR. Tracked per
@@ -756,6 +756,7 @@ def build_parser() -> argparse.ArgumentParser:
                "  eval \"$(whatisit -q 'show disk usage')\"",
         formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("words", nargs="*", help="your request, in plain English")
+    ap.add_argument("-V", "--version", action="version", version=f"whatisit {__version__}")
     ap.add_argument("-n", "--num", type=int, default=1, metavar="N",
                     help="show N alternative commands (default 1)")
     ap.add_argument("-e", "--execute", action="store_true",
@@ -848,11 +849,15 @@ class QueryArgs:
         self.idle_timeout = None
         self.host_context, self.grammar, self.debug, self.yes = None, None, False, False
         self.prefill_command = False
+        self.version = False
         i = 0
         while i < len(argv):
             a = argv[i]
             if a == "--":                      # explicit end of flags
                 i += 1
+                break
+            if a in ("-V", "--version"):
+                self.version = True
                 break
             if a in _FLAGS_NOARG:
                 if a == "--host-context":
@@ -927,12 +932,8 @@ class QueryArgs:
 
 def main(argv=None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
-    # Before load_config, so an existing config.json is read from its new home.
-    # Goes to stderr to keep `$(whatisit -q ...)` substitutions clean.
-    cfg_mod.migrate_legacy_dirs(echo=warn)
-    cfg = cfg_mod.load_config()
 
-    if not argv:
+    if not argv or argv[0] in ("-h", "--help"):
         build_parser().print_help()
         return 0
 
@@ -941,20 +942,25 @@ def main(argv=None) -> int:
     # stays a question.
     if argv[0] in SUBCOMMANDS:
         args = build_parser().parse_args(argv)
+    else:
+        try:
+            args = QueryArgs(argv)
+        except ValueError as e:
+            warn(f"whatisit: {e}")
+            return 2
+        if args.version:
+            out(f"whatisit {__version__}")
+            return 0
+        if not args.words:
+            build_parser().print_help()
+            return 0
+
+    # Before load_config, so an existing config.json is read from its new home.
+    # Goes to stderr to keep `$(whatisit -q ...)` substitutions clean.
+    cfg_mod.migrate_legacy_dirs(echo=warn)
+    cfg = cfg_mod.load_config()
+    if argv[0] in SUBCOMMANDS:
         return args.func(args, cfg)
-
-    if argv[0] in ("-h", "--help"):
-        build_parser().print_help()
-        return 0
-
-    try:
-        args = QueryArgs(argv)
-    except ValueError as e:
-        warn(f"whatisit: {e}")
-        return 2
-    if not args.words:
-        build_parser().print_help()
-        return 0
     return cmd_query(args, cfg)
 
 
