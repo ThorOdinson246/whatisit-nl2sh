@@ -18,7 +18,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from . import __version__, engine, fetch
+from . import __version__, engine, fetch, update
 from . import config as cfg_mod
 from .safety import check
 
@@ -246,6 +246,13 @@ def cmd_query(args, cfg: dict) -> int:
     # never printed after messages that refer to it.
     sys.stdout.flush()
     _warn_stray_flags(args)
+    if sys.stdout.isatty() and sys.stderr.isatty():
+        try:
+            msgs = update.notices(cfg)
+        except Exception:
+            msgs = []
+        for msg in msgs:
+            warn(YELLOW(f"  {msg}"))
 
     # Opt-in only (`whatisit config --set log_queries=true`). Shell requests can
     # contain hostnames, paths and credentials, so this is never on by default
@@ -474,10 +481,15 @@ def _setup_auto(args, cfg: dict, models_dir: Path, bin_dir: Path) -> int:
     want_model = not args.runtime_only
     want_runtime = not args.model_only
 
-    need_model = want_model and not model_file.exists()
+    found = update.installed_model()
+    stale = (want_model and found is not None and found[1] == args.size
+             and not update.is_pinned(update.model_sha(found[0])))
+    need_model = want_model and (stale or not model_file.exists())
     need_runtime = want_runtime and not server.exists()
 
-    if want_model and not need_model:
+    if stale:
+        print(f"  model {model_file.resolve().name} is out of date")
+    elif want_model and not need_model:
         print(f"  model present: {model_file.name} "
               f"({model_file.stat().st_size / 1e6:.0f} MB)")
     if want_runtime and not need_runtime:
@@ -604,6 +616,7 @@ def _fetch_model(args, spec: dict, model_file: Path, slot: Path) -> None:
     fetch.download(fetch.model_url(args.size), model_file,
                    sha256=spec["sha256"], expected_size=spec["size"],
                    progress=_progress)
+    update.remember_sha(model_file.resolve(), spec["sha256"])
     print(f"  model installed: {model_file}")
     # The engine resolves a fixed slot name, so a non-default size still has to
     # be reachable through it.

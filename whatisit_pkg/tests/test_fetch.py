@@ -384,10 +384,64 @@ class TestSetupCommand:
         models = home / "data" / "models"
         models.mkdir(parents=True)
         (models / fetch.MODELS["1.5b"]["file"]).write_bytes(b"already here")
+        monkeypatch.setitem(fetch.MODELS["1.5b"], "sha256",
+                            hashlib.sha256(b"already here").hexdigest())
         _no_downloads(monkeypatch)
         rc = cli.cmd_setup(_Args(auto=True, model_only=True), {})
         assert rc == 0
         assert "model present" in capsys.readouterr().out
+
+    def test_an_out_of_date_model_is_fetched_again(self, home, monkeypatch, capsys):
+        models = home / "data" / "models"
+        models.mkdir(parents=True)
+        (models / fetch.MODELS["1.5b"]["file"]).write_bytes(b"last release")
+        calls = []
+
+        def fake_download(url, dest, sha256=None, expected_size=None, progress=None):
+            calls.append(url)
+            dest.write_bytes(b"x")
+            return dest
+
+        monkeypatch.setattr(fetch, "download", fake_download)
+        monkeypatch.setattr(fetch, "free_bytes", lambda p: 10 ** 12)
+        assert cli.cmd_setup(_Args(auto=True, model_only=True), {}) == 0
+        assert len(calls) == 1
+        assert "out of date" in capsys.readouterr().out
+
+    @pytest.mark.parametrize("name", ["community.gguf", fetch.MODELS["1.5b"]["file"]])
+    def test_a_model_registered_by_hand_is_not_replaced(self, home, monkeypatch, capsys, name):
+        models = home / "data" / "models"
+        models.mkdir(parents=True)
+        mine = home / "mine" / name
+        mine.parent.mkdir()
+        mine.write_bytes(b"not ours")
+        (models / fetch.MODELS["1.5b"]["file"]).symlink_to(mine)
+        _no_downloads(monkeypatch)
+        assert cli.cmd_setup(_Args(auto=True, model_only=True), {}) == 0
+        assert "model present" in capsys.readouterr().out
+
+    def test_plain_setup_does_not_swap_an_old_3b_for_the_1_5b(self, home, monkeypatch, capsys):
+        models = home / "data" / "models"
+        models.mkdir(parents=True)
+        (models / fetch.MODELS["3b"]["file"]).write_bytes(b"last 3b release")
+        (models / fetch.MODELS["1.5b"]["file"]).symlink_to(models / fetch.MODELS["3b"]["file"])
+        _no_downloads(monkeypatch)
+        assert cli.cmd_setup(_Args(auto=True, model_only=True), {}) == 0
+        assert "model present" in capsys.readouterr().out
+
+    def test_a_fresh_download_is_not_hashed_again(self, home, monkeypatch):
+        def fake_download(url, dest, sha256=None, expected_size=None, progress=None):
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_bytes(b"x")
+            return dest
+
+        monkeypatch.setattr(fetch, "download", fake_download)
+        monkeypatch.setattr(fetch, "free_bytes", lambda p: 10 ** 12)
+        monkeypatch.setattr(fetch, "sha256_file", lambda p: pytest.fail("hashed"))
+        assert cli.cmd_setup(_Args(auto=True, model_only=True), {}) == 0
+        from whatisit import update
+        path = home / "data" / "models" / fetch.MODELS["1.5b"]["file"]
+        assert update.model_sha(path.resolve()) == fetch.MODELS["1.5b"]["sha256"]
 
     def test_existing_llama_server_on_path_is_reused(self, home, monkeypatch, capsys):
         _no_downloads(monkeypatch)

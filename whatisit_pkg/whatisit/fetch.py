@@ -264,6 +264,14 @@ def fmt_size(n: float) -> str:
     return f"{n / 1e9:.2f} GB" if n >= 1e9 else f"{n / 1e6:.0f} MB"
 
 
+def sha256_file(path: Path) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
 def download(url: str, dest: Path, sha256: str | None = None,
              expected_size: int | None = None, progress=None) -> Path:
     """Download to `dest`, verifying before it appears at that path.
