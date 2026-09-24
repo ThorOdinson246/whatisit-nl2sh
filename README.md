@@ -113,10 +113,13 @@ whatisit list files changed in the last week
 | `-n N` | show N alternative commands instead of one |
 | `-q`, `--quiet` | print only the bare command, for `$(...)` substitution |
 | `-t`, `--timing` | report how long generation took |
+| `-p`, `--prefill-command` | open the command in an editable prompt, then run what you submit |
 
-Nothing runs unless you pass `-e` and confirm at the prompt. Anything flagged
-`DANGER` is never auto-run at all. See [Safety](#safety) for what gets flagged
+Nothing runs unless you ask for it. A generated command flagged `DANGER` is
+refused. See [Safety](#safety) for what gets flagged
 and what the checker can't see.
+
+`-p` needs an interactive terminal and does not work on Windows.
 
 ```bash
 # use the result inline
@@ -124,6 +127,9 @@ cd "$(whatisit -q the directory holding the largest log file)"
 
 # review, then run
 whatisit -e remove every .pyc file under this tree
+
+# edit before running
+whatisit -p remove every .pyc file under this tree
 ```
 
 `whatisit stop` shuts down the resident model server. `whatisit config --set threads=4`
@@ -247,12 +253,6 @@ if you'd rather have accuracy than speed.
 | resident memory | 1.6 GB | ~3.4 GB |
 | cold start | ~2 s | ~4 s |
 
-The 3B is +4.0 points, and where it wins is the useful part. Split by the
-benchmark's own difficulty labels, it is **level on easy tasks, +3 points on
-medium, and +9 points on hard** — it buys you nothing on the queries you'd have
-got right anyway, and the most on the ones you'd have had to look up. It costs
-2.3x the latency for that.
-
 To switch:
 
 ```bash
@@ -269,11 +269,9 @@ whatisit stop
 ```
 
 Switching back is the same two commands with the other file. Both models live
-wherever you downloaded them; `setup` just points whatisit at one of them, so
-keeping both on disk costs nothing but the disk.
+wherever you downloaded them; `setup` just points whatisit at one of them.
 
-`whatisit doctor` names the model currently in use — it reports the registered
-slot and, in brackets, the file that slot actually points at.
+Use `whatisit doctor` for configuration status and health check.
 
 ## What it gets wrong
 
@@ -281,7 +279,7 @@ This is still in development and will get things wrong. It assumes you know
 your way around a terminal well enough to spot a bad command and fix it.
 
 - Single-turn. No memory of your last command, no shell state.
-- Output caps at 64 tokens. That's a command, not a script.
+- Output is capped at 64 tokens. So it can generate a command and is not usable for a script.
 - English only, and measured on one 300-task benchmark, which is not the same
   as being good at shell.
 
@@ -328,10 +326,7 @@ Training data, by measured row share of the 125,770-row pool:
 | command-generation | 7.3% | Apache-2.0 *(declared, unverified)* |
 | git-instruction | 7.1% | MIT *(declared, unverified)* |
 
-5.67% is verbatim NL2Bash arriving via the ALFA split. Its `data/bash` is MIT,
-not GPL. Warp workflows are not used. The three *declared* sources have
-licences I couldn't independently confirm. Deduplicated, with 0 exact and 0
-fuzzy matches against the benchmark test set.
+Complete training dataset is releasing soon. Keep an eye for it. 👀
 
 **Attribution:** includes content from
 [tldr-pages](https://github.com/tldr-pages/tldr) under
