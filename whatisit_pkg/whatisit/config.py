@@ -117,6 +117,8 @@ DEFAULTS = {
     # Never passed to llama-server itself (CVE-2026-43631 in builds b7492-b9060
     # is triggered by its native --sleep-idle-seconds flag).
     "idle_timeout": 0,
+    # Once a day, ask PyPI whether a newer release is out.
+    "update_check": True,
 }
 
 

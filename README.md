@@ -7,7 +7,7 @@
 [![license](https://img.shields.io/github/license/ThorOdinson246/whatisit-nl2sh?color=blue)](LICENSE)
 
 Ask for a shell command in plain English. Runs on your own machine on CPU, no
-GPU and no network. Answers in about a second. Optionally any OpenAI-compatible
+GPU, and your requests never leave it. Answers in about a second. Optionally any OpenAI-compatible
 endpoint instead.
 
 ![whatisit in use](whatisit.gif)
@@ -142,6 +142,17 @@ whatisit config --set idle_timeout=300        # persist it (0 = never, default)
 A watchdog stops the server at the deadline and frees the memory it was
 holding; the next query pays a cold start. The deadline is re-armed on every
 query, including one still running.
+
+### Update notices
+
+Once a day, in the background, whatisit asks pypi.org for the latest version
+and tells you after an answer if there's a newer one, or if a newer model
+ships and `whatisit setup` would fetch it. Your requests are never sent. To
+turn it off:
+
+```bash
+whatisit config --set update_check=false
+```
 
 ## Remote endpoints
 

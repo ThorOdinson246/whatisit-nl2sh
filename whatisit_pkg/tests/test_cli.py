@@ -594,3 +594,40 @@ class TestIdleTimeoutFlag:
         # documented contract); the saved 300 has to survive untouched.
         from whatisit import config as cfg_mod
         assert cfg_mod.load_config()["idle_timeout"] == 300
+
+
+class TestUpdateNotices:
+    @pytest.fixture
+    def shown(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("WHATISIT_CONFIG_DIR", str(tmp_path / "cfg"))
+        monkeypatch.setenv("WHATISIT_DATA_DIR", str(tmp_path / "data"))
+        monkeypatch.setattr(cli.engine, "generate", lambda *a, **k: (["ls"], 0.01, "server"))
+        calls = []
+        monkeypatch.setattr(cli.update, "notices", lambda cfg: calls.append(1) or ["newer"])
+        return calls
+
+    def _tty(self, monkeypatch, out, err):
+        monkeypatch.setattr(cli.sys.stdout, "isatty", lambda: out)
+        monkeypatch.setattr(cli.sys.stderr, "isatty", lambda: err)
+
+    def test_shown_after_the_answer_in_a_terminal(self, shown, monkeypatch, capsys):
+        self._tty(monkeypatch, True, True)
+        assert cli.main(["list", "files"]) == 0
+        cap = capsys.readouterr()
+        assert cap.out.strip() == "ls" and "newer" in cap.err
+
+    @pytest.mark.parametrize("out,err", [(False, True), (True, False)])
+    def test_not_shown_when_either_stream_is_redirected(self, shown, monkeypatch, out, err):
+        self._tty(monkeypatch, out, err)
+        assert cli.main(["list", "files"]) == 0
+        assert shown == []
+
+    def test_not_shown_with_quiet(self, shown, monkeypatch, capsys):
+        self._tty(monkeypatch, True, True)
+        assert cli.main(["-q", "list", "files"]) == 0
+        assert shown == [] and capsys.readouterr().out == "ls\n"
+
+    def test_a_failing_check_never_breaks_the_query(self, shown, monkeypatch):
+        self._tty(monkeypatch, True, True)
+        monkeypatch.setattr(cli.update, "notices", lambda cfg: 1 / 0)
+        assert cli.main(["list", "files"]) == 0

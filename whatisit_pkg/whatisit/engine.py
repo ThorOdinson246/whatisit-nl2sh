@@ -341,6 +341,10 @@ def _clear_watch_state() -> None:
 
 def _spawn_watchdog() -> None:
     """Spawn the detached singleton watchdog, best-effort."""
+    spawn_detached("whatisit.watchdog")
+
+
+def spawn_detached(module: str) -> None:
     try:
         kwargs = {}
         if _is_windows():
@@ -350,7 +354,7 @@ def _spawn_watchdog() -> None:
             kwargs["start_new_session"] = True
         # cwd: -m puts it first on sys.path, so running from a directory
         # holding a whatisit/ package would import that one instead.
-        subprocess.Popen([sys.executable, "-m", "whatisit.watchdog"],
+        subprocess.Popen([sys.executable, "-m", module],
                          cwd=str(_state_dir()),
                          stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                          stderr=subprocess.DEVNULL, close_fds=True, **kwargs)
