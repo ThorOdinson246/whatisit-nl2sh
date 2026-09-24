@@ -108,6 +108,34 @@ class TestSubcommandRoutingIsFirstTokenOnly:
         assert rc == 0
         assert captured["prompt"] == "show me the git config"
 
+    @pytest.mark.parametrize("argv", [["--version"], ["-V"], ["-q", "--version"],
+                                      ["-n", "2", "-V"], ["-V", "-n"], ["-e", "-V", "foo"]])
+    def test_version_flag_prints_version_without_generating(self, monkeypatch, capsys, argv):
+        monkeypatch.setattr(cli.engine, "generate",
+                            lambda *a, **k: pytest.fail("sent to the model"))
+        assert cli.main(argv) == 0
+        assert capsys.readouterr().out == f"whatisit {cli.__version__}\n"
+
+    def test_version_does_not_read_config(self, monkeypatch, capsys):
+        monkeypatch.setattr(cli.cfg_mod, "load_config", lambda: pytest.fail("read config"))
+        monkeypatch.setattr(cli.cfg_mod, "migrate_legacy_dirs",
+                            lambda **k: pytest.fail("moved dirs"))
+        assert cli.main(["--version"]) == 0
+
+    def test_help_lists_version(self):
+        assert "-V, --version" in cli._ANSI_RE.sub("", cli.build_parser().format_help())
+
+    def test_version_word_later_in_a_request_stays_a_request(self, monkeypatch):
+        seen = {}
+
+        def fake_generate(prompt, cfg, **kw):
+            seen["prompt"] = prompt
+            return (["python --version"], 0.01, "server")
+
+        monkeypatch.setattr(cli.engine, "generate", fake_generate)
+        assert cli.main(["show", "python", "--version"]) == 0
+        assert seen["prompt"] == "show python --version"
+
     def test_setup_doctor_stop_are_recognized_subcommands(self):
         assert cli.SUBCOMMANDS == {"setup", "doctor", "stop", "config"}
 
