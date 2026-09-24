@@ -129,6 +129,20 @@ whatisit -e remove every .pyc file under this tree
 `whatisit stop` shuts down the resident model server. `whatisit config --set threads=4`
 changes settings.
 
+### Putting the command on your prompt
+
+Add this to `~/.zshrc` or `~/.bashrc`:
+
+```bash
+eval "$(whatisit shell-init)"
+```
+
+Then `whatisit <request>` puts the command on your next prompt instead of
+printing it, so you can edit it and run it with Enter in your own shell. `cd`
+sticks and it lands in your history. In bash, which can't prefill the prompt,
+it's printed and put in history, so press Up to get it. Subcommands and flags
+like `-n 3` work as before, and a command flagged `DANGER` is not put anywhere.
+
 ### Unloading the model automatically
 
 The resident server holds the model in RAM. On a tight box, have it unload

@@ -728,6 +728,41 @@ def cmd_stop(args, cfg: dict) -> int:
     return 0
 
 
+# bash can't prefill the prompt, so the command goes into history instead.
+_SHELL_INIT = {
+    "zsh": """whatisit() {
+  emulate -L zsh
+  case "$1" in
+    %(passthrough)s) command whatisit "$@"; return $? ;;
+  esac
+  local cmd
+  cmd=$(command whatisit -q -- "$@") || return $?
+  [[ -n $cmd ]] && print -z -- "$cmd"
+}""",
+    "bash": """whatisit() {
+  case "$1" in
+    %(passthrough)s) command whatisit "$@"; return $? ;;
+  esac
+  local cmd
+  cmd=$(command whatisit -q -- "$@") || return $?
+  [ -n "$cmd" ] || return 0
+  printf '%%s\\n' "$cmd"
+  history -s "$cmd"
+}""",
+}
+
+
+def cmd_shell_init(args, cfg: dict) -> int:
+    shell = args.shell or os.path.basename(os.environ.get("SHELL", ""))
+    if shell not in _SHELL_INIT:
+        warn(f"whatisit: no shell integration for {shell or 'this shell'} "
+             f"(supported: {', '.join(sorted(_SHELL_INIT))})")
+        return 0
+    passthrough = "|".join(sorted(SUBCOMMANDS) + ["-*", '""'])
+    out(_SHELL_INIT[shell] % {"passthrough": passthrough})
+    return 0
+
+
 def cmd_config(args, cfg: dict) -> int:
     if args.set:
         for kv in args.set:
@@ -825,13 +860,17 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("doctor", help="check the installation").set_defaults(func=cmd_doctor)
     sub.add_parser("stop", help="stop the resident model server").set_defaults(func=cmd_stop)
+    si = sub.add_parser("shell-init", help="print a shell function that puts the "
+                                           "command on your next prompt")
+    si.add_argument("--shell", help="zsh or bash (default: from $SHELL)")
+    si.set_defaults(func=cmd_shell_init)
     c = sub.add_parser("config", help="show or change settings")
     c.add_argument("--set", nargs="+", metavar="K=V")
     c.set_defaults(func=cmd_config)
     return ap
 
 
-SUBCOMMANDS = {"setup", "doctor", "stop", "config"}
+SUBCOMMANDS = {"setup", "doctor", "stop", "config", "shell-init"}
 _FLAGS_NOARG = {"-e", "--execute", "-q", "--quiet", "-t", "--timing", "--oneshot",
                 "--host-context", "--no-host-context",
                 "--grammar", "--no-grammar", "--debug", "-y", "--yes",

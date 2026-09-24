@@ -137,7 +137,7 @@ class TestSubcommandRoutingIsFirstTokenOnly:
         assert seen["prompt"] == "show python --version"
 
     def test_setup_doctor_stop_are_recognized_subcommands(self):
-        assert cli.SUBCOMMANDS == {"setup", "doctor", "stop", "config"}
+        assert cli.SUBCOMMANDS == {"setup", "doctor", "stop", "config", "shell-init"}
 
 
 # --------------------------------------------------------------- cmd_query
@@ -273,6 +273,34 @@ class TestCmdStop:
 
 
 # ------------------------------------------------------------------ parser
+
+class TestShellInit:
+    @pytest.mark.parametrize("shell", ["zsh", "bash"])
+    def test_emits_a_function_that_calls_the_binary(self, capsys, shell):
+        assert cli.main(["shell-init", "--shell", shell]) == 0
+        body = capsys.readouterr().out
+        assert body.startswith("whatisit()")
+        assert "command whatisit -q --" in body
+
+    @pytest.mark.parametrize("shell", ["zsh", "bash"])
+    def test_subcommands_and_flags_pass_through(self, capsys, shell):
+        cli.main(["shell-init", "--shell", shell])
+        body = capsys.readouterr().out.splitlines()
+        line = next(ln for ln in body if 'command whatisit "$@"' in ln)
+        assert set(line.split(")")[0].strip().split("|")) >= cli.SUBCOMMANDS | {"-*"}
+
+    def test_detects_the_shell_from_the_environment(self, monkeypatch, capsys):
+        monkeypatch.setenv("SHELL", "/usr/local/bin/zsh")
+        assert cli.main(["shell-init"]) == 0
+        assert "print -z" in capsys.readouterr().out
+
+    @pytest.mark.parametrize("argv", [["shell-init", "--shell", "fish"], ["shell-init"]])
+    def test_unknown_shell_prints_nothing_to_eval(self, monkeypatch, capsys, argv):
+        monkeypatch.setenv("SHELL", "/bin/tcsh")
+        assert cli.main(argv) == 0
+        cap = capsys.readouterr()
+        assert cap.out == "" and "no shell integration" in cap.err
+
 
 class TestBuildParser:
     def test_help_flag_does_not_crash(self):
