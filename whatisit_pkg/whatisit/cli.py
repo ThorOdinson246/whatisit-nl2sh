@@ -895,6 +895,7 @@ class QueryArgs:
     """
 
     def __init__(self, argv: list[str]):
+        argv = list(argv)
         self.num, self.execute, self.quiet = 1, False, False
         self.timing, self.oneshot = False, False
         self.port, self.threads, self.ctx_size, self.model = None, None, None, None
@@ -905,6 +906,12 @@ class QueryArgs:
         i = 0
         while i < len(argv):
             a = argv[i]
+            if a.startswith("-") and "=" in a:
+                flag, val = a.split("=", 1)
+                if flag in _FLAGS_ARG or flag in _FLAGS_QUERY_ARG:
+                    a = flag
+                    argv = argv[:i] + [flag, val] + argv[i + 1:]
+
             if a == "--":                      # explicit end of flags
                 i += 1
                 break
