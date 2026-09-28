@@ -43,6 +43,14 @@ class TestQueryArgsHandParsing:
         assert args.num == 3
         assert args.words == ["compress", "this", "folder"]
 
+    def test_equals_flag_form(self):
+        args1 = cli.QueryArgs(["--num=3", "list", "files"])
+        assert args1.num == 3
+        assert args1.words == ["list", "files"]
+        args2 = cli.QueryArgs(["--port=8080", "ls"])
+        assert args2.port == 8080
+        assert args2.words == ["ls"]
+
     def test_dash_n3_glued_form(self):
         args = cli.QueryArgs(["-n3", "compress", "this", "folder"])
         assert args.num == 3
