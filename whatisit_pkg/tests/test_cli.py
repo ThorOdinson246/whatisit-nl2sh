@@ -64,6 +64,17 @@ class TestQueryArgsHandParsing:
         with pytest.raises(ValueError):
             cli.QueryArgs(["-n"])
 
+    @pytest.mark.parametrize("argv", [["-VV"], ["--version=x"],
+                                      ["-e", "--nope", "list", "files"]])
+    def test_unknown_leading_flag_raises(self, argv):
+        # Issue #65: a typo'd flag used to become the start of the request.
+        with pytest.raises(ValueError, match="unknown flag"):
+            cli.QueryArgs(argv)
+
+    def test_double_dash_allows_request_starting_with_a_dash(self):
+        args = cli.QueryArgs(["--", "-rf", "meaning"])
+        assert args.words == ["-rf", "meaning"]
+
     def test_no_flags_at_all(self):
         args = cli.QueryArgs(["show", "disk", "usage"])
         assert args.words == ["show", "disk", "usage"]
@@ -115,6 +126,27 @@ class TestSubcommandRoutingIsFirstTokenOnly:
                             lambda *a, **k: pytest.fail("sent to the model"))
         assert cli.main(argv) == 0
         assert capsys.readouterr().out == f"whatisit {cli.__version__}\n"
+
+    @pytest.mark.parametrize("argv", [["-e", "-h"], ["-e", "--help"]])
+    def test_help_after_a_leading_flag_prints_help(self, monkeypatch, capsys, argv):
+        monkeypatch.setattr(cli.engine, "generate",
+                            lambda *a, **k: pytest.fail("sent to the model"))
+        monkeypatch.setattr(cli.cfg_mod, "load_config", lambda: pytest.fail("read config"))
+        monkeypatch.setattr(cli.cfg_mod, "migrate_legacy_dirs",
+                            lambda **k: pytest.fail("moved dirs"))
+        assert cli.main(argv) == 0
+        assert "usage: whatisit" in cli._ANSI_RE.sub("", capsys.readouterr().out)
+
+    @pytest.mark.parametrize("flag", ["-VV", "--version=x"])
+    def test_unknown_leading_flag_exits_2_without_generating(self, monkeypatch,
+                                                             capsys, flag):
+        monkeypatch.setattr(cli.engine, "generate",
+                            lambda *a, **k: pytest.fail("sent to the model"))
+        assert cli.main([flag]) == 2
+        cap = capsys.readouterr()
+        assert cap.out == ""
+        assert cap.err == (f"whatisit: unknown flag {flag} "
+                           "(use -- to start the request with a dash)\n")
 
     def test_version_does_not_read_config(self, monkeypatch, capsys):
         monkeypatch.setattr(cli.cfg_mod, "load_config", lambda: pytest.fail("read config"))

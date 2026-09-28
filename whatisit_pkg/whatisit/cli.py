@@ -901,7 +901,7 @@ class QueryArgs:
         self.idle_timeout = None
         self.host_context, self.grammar, self.debug, self.yes = None, None, False, False
         self.prefill_command = False
-        self.version = False
+        self.version, self.help = False, False
         i = 0
         while i < len(argv):
             a = argv[i]
@@ -910,6 +910,9 @@ class QueryArgs:
                 break
             if a in ("-V", "--version"):
                 self.version = True
+                break
+            if a in ("-h", "--help"):
+                self.help = True
                 break
             if a in _FLAGS_NOARG:
                 if a == "--host-context":
@@ -960,6 +963,8 @@ class QueryArgs:
                 i += 1
             elif a.startswith("-n") and len(a) > 2 and a[2:].isdigit():
                 self.num = int(a[2:])          # -n3
+            elif a.startswith("-"):            # typo'd flag, not request text
+                raise ValueError(f"unknown flag {a} (use -- to start the request with a dash)")
             else:
                 break                          # request text starts here
             i += 1
@@ -1002,6 +1007,9 @@ def main(argv=None) -> int:
             return 2
         if args.version:
             out(f"whatisit {__version__}")
+            return 0
+        if args.help:
+            build_parser().print_help()
             return 0
         if not args.words:
             build_parser().print_help()
