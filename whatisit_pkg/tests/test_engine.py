@@ -1662,16 +1662,23 @@ class TestIdleTimeout:
 
         seen = {}
 
+        def last_use():
+            for _ in range(100):
+                try:
+                    return float(engine._last_use_path().read_text())
+                except PermissionError:
+                    time.sleep(0.01)
+            raise AssertionError("server.last_use stayed unreadable")
+
         def slow_query(*a, **k):
-            first = float(engine._last_use_path().read_text())
+            first = last_use()
             # Block past one beat interval, watching for a refresh.
             deadline = time.monotonic() + 2.0
             while time.monotonic() < deadline:
-                if float(engine._last_use_path().read_text()) - first > 0.05:
+                if last_use() - first > 0.05:
                     break
                 time.sleep(0.01)
-            seen["refreshed"] = \
-                float(engine._last_use_path().read_text()) - first > 0.05
+            seen["refreshed"] = last_use() - first > 0.05
             return [("echo hi", None)]
 
         monkeypatch.setattr(engine, "_query_server", slow_query)
